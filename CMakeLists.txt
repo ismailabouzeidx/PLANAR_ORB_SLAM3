@@ -226,6 +226,10 @@ add_executable(mono_inertial_tum_vi
         Examples/Monocular-Inertial/mono_inertial_tum_vi.cc)
 target_link_libraries(mono_inertial_tum_vi ${PROJECT_NAME})
 
+add_executable(mono_inertial_inscoi
+        Examples/Monocular-Inertial/mono_inertial_inscoi.cc)
+target_link_libraries(mono_inertial_inscoi ${PROJECT_NAME})
+
 if(realsense2_FOUND)
     add_executable(mono_inertial_realsense_t265
             Examples/Monocular-Inertial/mono_inertial_realsense_t265.cc)

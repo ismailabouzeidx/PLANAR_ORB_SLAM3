@@ -134,9 +134,6 @@ int main(int argc, char **argv)
             usleep((T-ttrack)*1e6);
     }
 
-    // Stop all threads
-    SLAM.Shutdown();
-
     // Tracking time statistics
     sort(vTimesTrack.begin(),vTimesTrack.end());
     float totaltime = 0;
@@ -148,8 +145,23 @@ int main(int argc, char **argv)
     cout << "median tracking time: " << vTimesTrack[nImages/2] << endl;
     cout << "mean tracking time: " << totaltime/nImages << endl;
 
-    // Save camera trajectory
-    SLAM.SaveKeyFrameTrajectoryTUM("KeyFrameTrajectory.txt");
+    // Save camera trajectory BEFORE shutdown
+    SLAM.SaveTrajectoryEuRoC("CameraTrajectory.txt");
+    SLAM.SaveKeyFrameTrajectoryEuRoC("KeyFrameTrajectory.txt");
+
+    cout << endl << "All frames processed. Viewer will stay open. Press Ctrl+C to exit." << endl;
+
+    // Keep the program running so viewer stays open
+    // Don't call Shutdown() to avoid segfault - let viewer run until user closes it
+    while(true)
+    {
+        usleep(100000); // Sleep 100ms
+        if(SLAM.isShutDown())
+            break;
+    }
+
+    // Stop all threads (only if we get here)
+    SLAM.Shutdown();
 
     return 0;
 }

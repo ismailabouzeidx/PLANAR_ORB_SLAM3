@@ -153,6 +153,7 @@ public:
     list<KeyFrame*> mlpReferences;
     list<double> mlFrameTimes;
     list<bool> mlbLost;
+    list<long unsigned int> mlFrameIds;
 
     // frames with estimated pose
     int mTrackedFr;

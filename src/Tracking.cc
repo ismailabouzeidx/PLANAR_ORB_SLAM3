@@ -2307,6 +2307,7 @@ void Tracking::Track()
             mlpReferences.push_back(mCurrentFrame.mpReferenceKF);
             mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
             mlbLost.push_back(mState==LOST);
+            mlFrameIds.push_back(mCurrentFrame.mnId);
         }
         else
         {
@@ -2315,6 +2316,7 @@ void Tracking::Track()
             mlpReferences.push_back(mlpReferences.back());
             mlFrameTimes.push_back(mlFrameTimes.back());
             mlbLost.push_back(mState==LOST);
+            mlFrameIds.push_back(mlFrameIds.back());
         }
 
     }
@@ -2453,6 +2455,8 @@ void Tracking::MonocularInitialization()
         // Set Reference Frame
         if(mCurrentFrame.mvKeys.size()>100)
         {
+            cout << "[INIT DEBUG] Setting reference frame - Features: " << mCurrentFrame.mvKeys.size() 
+                 << ", Frame ID: " << mCurrentFrame.mnId << endl;
 
             mInitialFrame = Frame(mCurrentFrame);
             mLastFrame = Frame(mCurrentFrame);
@@ -2477,11 +2481,17 @@ void Tracking::MonocularInitialization()
 
             return;
         }
+        else
+        {
+            cout << "[INIT DEBUG] Not enough features for reference frame: " << mCurrentFrame.mvKeys.size() << " (need >100)" << endl;
+        }
     }
     else
     {
         if (((int)mCurrentFrame.mvKeys.size()<=100)||((mSensor == System::IMU_MONOCULAR)&&(mLastFrame.mTimeStamp-mInitialFrame.mTimeStamp>1.0)))
         {
+            cout << "[INIT DEBUG] Resetting - Features: " << mCurrentFrame.mvKeys.size() 
+                 << ", Time since init: " << (mLastFrame.mTimeStamp-mInitialFrame.mTimeStamp) << "s" << endl;
             mbReadyToInitializate = false;
 
             return;
@@ -2491,9 +2501,14 @@ void Tracking::MonocularInitialization()
         ORBmatcher matcher(0.9,true);
         int nmatches = matcher.SearchForInitialization(mInitialFrame,mCurrentFrame,mvbPrevMatched,mvIniMatches,100);
 
+        cout << "[INIT DEBUG] Frame " << mCurrentFrame.mnId << " - Initial features: " << mInitialFrame.mvKeys.size() 
+             << ", Current features: " << mCurrentFrame.mvKeys.size() 
+             << ", Matches found: " << nmatches << endl;
+
         // Check if there are enough correspondences
         if(nmatches<100)
         {
+            cout << "[INIT DEBUG] FAILED: Not enough matches (" << nmatches << " < 100)" << endl;
             mbReadyToInitializate = false;
             return;
         }
@@ -2501,8 +2516,12 @@ void Tracking::MonocularInitialization()
         Sophus::SE3f Tcw;
         vector<bool> vbTriangulated; // Triangulated Correspondences (mvIniMatches)
 
-        if(mpCamera->ReconstructWithTwoViews(mInitialFrame.mvKeysUn,mCurrentFrame.mvKeysUn,mvIniMatches,Tcw,mvIniP3D,vbTriangulated))
+        cout << "[INIT DEBUG] Attempting reconstruction with " << nmatches << " matches..." << endl;
+        bool bReconstruct = mpCamera->ReconstructWithTwoViews(mInitialFrame.mvKeysUn,mCurrentFrame.mvKeysUn,mvIniMatches,Tcw,mvIniP3D,vbTriangulated);
+        
+        if(bReconstruct)
         {
+            int nTriangulated = 0;
             for(size_t i=0, iend=mvIniMatches.size(); i<iend;i++)
             {
                 if(mvIniMatches[i]>=0 && !vbTriangulated[i])
@@ -2510,13 +2529,25 @@ void Tracking::MonocularInitialization()
                     mvIniMatches[i]=-1;
                     nmatches--;
                 }
+                else if(mvIniMatches[i]>=0 && vbTriangulated[i])
+                {
+                    nTriangulated++;
+                }
             }
+
+            cout << "[INIT DEBUG] SUCCESS! Triangulated points: " << nTriangulated 
+                 << ", Final matches: " << nmatches << endl;
+            cout << "[INIT DEBUG] Transformation: " << endl << Tcw.matrix() << endl;
 
             // Set Frame Poses
             mInitialFrame.SetPose(Sophus::SE3f());
             mCurrentFrame.SetPose(Tcw);
 
             CreateInitialMapMonocular();
+        }
+        else
+        {
+            cout << "[INIT DEBUG] FAILED: Reconstruction returned false" << endl;
         }
     }
 }

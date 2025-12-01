@@ -110,21 +110,36 @@ namespace ORB_SLAM3
         threadF.join();
 
         // Compute ratio of scores
-        if(SH+SF == 0.f) return false;
+        if(SH+SF == 0.f) 
+        {
+            cout << "[RECONSTRUCT DEBUG] Both H and F scores are zero!" << endl;
+            return false;
+        }
         float RH = SH/(SH+SF);
 
-        float minParallax = 1.0;
+        cout << "[RECONSTRUCT DEBUG] Total matches: " << N << ", H score: " << SH 
+             << ", F score: " << SF << ", Ratio H/(H+F): " << RH << endl;
+
+        // Lower parallax threshold for forward-facing cameras on flat surfaces
+        float minParallax = 0.1;  // Reduced from 1.0 to 0.1 for low-parallax scenes
 
         // Try to reconstruct from homography or fundamental depending on the ratio (0.40-0.45)
-        if(RH>0.50) // if(RH>0.40)
+        // Lower threshold to prefer homography for planar scenes
+        if(RH>0.45) // Lowered from 0.50 to 0.45
         {
-            //cout << "Initialization from Homography" << endl;
-            return ReconstructH(vbMatchesInliersH,H, mK,T21,vP3D,vbTriangulated,minParallax,50);
+            cout << "[RECONSTRUCT DEBUG] Attempting reconstruction from HOMography (RH=" << RH << ")" << endl;
+            bool result = ReconstructH(vbMatchesInliersH,H, mK,T21,vP3D,vbTriangulated,minParallax,50);
+            if(!result)
+                cout << "[RECONSTRUCT DEBUG] Homography reconstruction FAILED" << endl;
+            return result;
         }
         else //if(pF_HF>0.6)
         {
-            //cout << "Initialization from Fundamental" << endl;
-            return ReconstructF(vbMatchesInliersF,F,mK,T21,vP3D,vbTriangulated,minParallax,50);
+            cout << "[RECONSTRUCT DEBUG] Attempting reconstruction from Fundamental matrix (RH=" << RH << ")" << endl;
+            bool result = ReconstructF(vbMatchesInliersF,F,mK,T21,vP3D,vbTriangulated,minParallax,50);
+            if(!result)
+                cout << "[RECONSTRUCT DEBUG] Fundamental matrix reconstruction FAILED" << endl;
+            return result;
         }
     }
 
@@ -504,7 +519,15 @@ namespace ORB_SLAM3
 
         int maxGood = max(nGood1,max(nGood2,max(nGood3,nGood4)));
 
-        int nMinGood = max(static_cast<int>(0.9*N),minTriangulated);
+        // Lower requirement for planar scenes (0.7 instead of 0.9)
+        int nMinGood = max(static_cast<int>(0.7*N),minTriangulated);
+
+        cout << "[RECONSTRUCT F] Inlier matches: " << N << ", Min required: " << nMinGood << endl;
+        cout << "[RECONSTRUCT F] Hypothesis scores: nGood1=" << nGood1 << " (parallax=" << parallax1 
+             << "), nGood2=" << nGood2 << " (parallax=" << parallax2 
+             << "), nGood3=" << nGood3 << " (parallax=" << parallax3 
+             << "), nGood4=" << nGood4 << " (parallax=" << parallax4 << ")" << endl;
+        cout << "[RECONSTRUCT F] Max good: " << maxGood << ", Min parallax required: " << minParallax << endl;
 
         int nsimilar = 0;
         if(nGood1>0.7*maxGood)
@@ -519,6 +542,10 @@ namespace ORB_SLAM3
         // If there is not a clear winner or not enough triangulated points reject initialization
         if(maxGood<nMinGood || nsimilar>1)
         {
+            if(maxGood < nMinGood)
+                cout << "[RECONSTRUCT F] FAILED: Not enough good points (" << maxGood << " < " << nMinGood << ")" << endl;
+            if(nsimilar > 1)
+                cout << "[RECONSTRUCT F] FAILED: Ambiguous solution (nsimilar=" << nsimilar << ")" << endl;
             return false;
         }
 
@@ -527,41 +554,61 @@ namespace ORB_SLAM3
         {
             if(parallax1>minParallax)
             {
+                cout << "[RECONSTRUCT F] SUCCESS with hypothesis 1, parallax=" << parallax1 << endl;
                 vP3D = vP3D1;
                 vbTriangulated = vbTriangulated1;
 
                 T21 = Sophus::SE3f(R1, t1);
                 return true;
             }
+            else
+            {
+                cout << "[RECONSTRUCT F] FAILED: Parallax too small (" << parallax1 << " < " << minParallax << ")" << endl;
+            }
         }else if(maxGood==nGood2)
         {
             if(parallax2>minParallax)
             {
+                cout << "[RECONSTRUCT F] SUCCESS with hypothesis 2, parallax=" << parallax2 << endl;
                 vP3D = vP3D2;
                 vbTriangulated = vbTriangulated2;
 
                 T21 = Sophus::SE3f(R2, t1);
                 return true;
             }
+            else
+            {
+                cout << "[RECONSTRUCT F] FAILED: Parallax too small (" << parallax2 << " < " << minParallax << ")" << endl;
+            }
         }else if(maxGood==nGood3)
         {
             if(parallax3>minParallax)
             {
+                cout << "[RECONSTRUCT F] SUCCESS with hypothesis 3, parallax=" << parallax3 << endl;
                 vP3D = vP3D3;
                 vbTriangulated = vbTriangulated3;
 
                 T21 = Sophus::SE3f(R1, t2);
                 return true;
             }
+            else
+            {
+                cout << "[RECONSTRUCT F] FAILED: Parallax too small (" << parallax3 << " < " << minParallax << ")" << endl;
+            }
         }else if(maxGood==nGood4)
         {
             if(parallax4>minParallax)
             {
+                cout << "[RECONSTRUCT F] SUCCESS with hypothesis 4, parallax=" << parallax4 << endl;
                 vP3D = vP3D4;
                 vbTriangulated = vbTriangulated4;
 
                 T21 = Sophus::SE3f(R2, t2);
                 return true;
+            }
+            else
+            {
+                cout << "[RECONSTRUCT F] FAILED: Parallax too small (" << parallax4 << " < " << minParallax << ")" << endl;
             }
         }
 
@@ -596,6 +643,8 @@ namespace ORB_SLAM3
 
         if(d1/d2<1.00001 || d2/d3<1.00001)
         {
+            cout << "[RECONSTRUCT H] FAILED: Singular values too close (d1/d2=" << (d1/d2) 
+                 << ", d2/d3=" << (d2/d3) << ")" << endl;
             return false;
         }
 
@@ -722,12 +771,48 @@ namespace ORB_SLAM3
         }
 
 
-        if(secondBestGood<0.75*bestGood && bestParallax>=minParallax && bestGood>minTriangulated && bestGood>0.9*N)
+        // For planar scenes (translation-only on flat surface), allow ambiguous solutions
+        // if parallax is good enough - all 8 homography hypotheses are equally valid for pure planar motion
+        bool allowAmbiguous = (bestParallax >= 0.5); // If parallax > 0.5, allow ambiguous solutions
+        
+        // Also lower the secondBest threshold for planar scenes
+        float secondBestThreshold = 0.75;
+        if(bestParallax >= 0.3) // For moderate parallax, be more lenient
+            secondBestThreshold = 0.95; // Almost allow equal scores
+        
+        // Lower good points requirement for planar scenes (0.5*N instead of 0.7*N)
+        float minGoodRatio = 0.7;
+        if(bestParallax >= 0.5) // For good parallax, be more lenient
+            minGoodRatio = 0.5;
+        int minGoodRequired = max(static_cast<int>(minGoodRatio*N), minTriangulated);
+        
+        cout << "[RECONSTRUCT H] Inlier matches: " << N << ", Best good: " << bestGood 
+             << ", Second best: " << secondBestGood << ", Best parallax: " << bestParallax << endl;
+        cout << "[RECONSTRUCT H] Requirements: secondBest<" << secondBestThreshold << "*best (" << (secondBestGood < secondBestThreshold*bestGood)
+             << "), parallax>=" << minParallax << " (" << (bestParallax>=minParallax)
+             << "), bestGood>" << minTriangulated << " (" << (bestGood>minTriangulated)
+             << "), bestGood>" << minGoodRatio << "*N (" << (bestGood>minGoodRequired) << ")" << endl;
+        
+        if((secondBestGood < secondBestThreshold*bestGood || allowAmbiguous) && 
+           bestParallax>=minParallax && bestGood>minTriangulated && bestGood>minGoodRequired)
         {
+            if(allowAmbiguous && secondBestGood >= 0.75*bestGood)
+                cout << "[RECONSTRUCT H] SUCCESS with ambiguous solution (allowed due to good parallax=" << bestParallax << ")" << endl;
+            else
+                cout << "[RECONSTRUCT H] SUCCESS with solution " << bestSolutionIdx << endl;
             T21 = Sophus::SE3f(vR[bestSolutionIdx], vt[bestSolutionIdx]);
+            vP3D = bestP3D;
             vbTriangulated = bestTriangulated;
 
             return true;
+        }
+        else
+        {
+            cout << "[RECONSTRUCT H] FAILED: Requirements not met" << endl;
+            if(secondBestGood >= 0.75*bestGood)
+                cout << "[RECONSTRUCT H]   Reason: Ambiguous solution (secondBest=" << secondBestGood 
+                     << " >= " << secondBestThreshold << "*best=" << (secondBestThreshold*bestGood) 
+                     << "), parallax=" << bestParallax << endl;
         }
 
         return false;
