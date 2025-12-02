@@ -892,4 +892,46 @@ bool MapDrawer::ComputeBEVHomography(KeyFrame* pKF, Eigen::Matrix3f& H_img2bev)
     return true;
 }
 
+void MapDrawer::ShowBEVImage(const cv::Mat& img, KeyFrame* pKF, const std::string& window_name, int max_display_size)
+{
+    if (!m_hasAlignment || !pKF || img.empty()) {
+        std::cerr << "[MapDrawer] Cannot show BEV: alignment not available or invalid input" << std::endl;
+        return;
+    }
+
+    // Compute BEV homography
+    Eigen::Matrix3f H_img2bev;
+    if (!ComputeBEVHomography(pKF, H_img2bev)) {
+        std::cerr << "[MapDrawer] Failed to compute BEV homography" << std::endl;
+        return;
+    }
+
+    // Convert Eigen matrix to OpenCV Mat
+    cv::Mat H_cv(3, 3, CV_32F);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            H_cv.at<float>(r, c) = H_img2bev(r, c);
+        }
+    }
+
+    // Warp image to BEV
+    cv::Mat img_bev;
+    cv::warpPerspective(img, img_bev, H_cv, cv::Size(m_bev_width, m_bev_height),
+                        cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+
+    // Resize to fit screen if needed
+    cv::Mat img_display = img_bev;
+    if (m_bev_width > max_display_size || m_bev_height > max_display_size) {
+        float scale = std::min(static_cast<float>(max_display_size) / m_bev_width,
+                              static_cast<float>(max_display_size) / m_bev_height);
+        int new_w = static_cast<int>(m_bev_width * scale);
+        int new_h = static_cast<int>(m_bev_height * scale);
+        cv::resize(img_bev, img_display, cv::Size(new_w, new_h), 0, 0, cv::INTER_AREA);
+    }
+
+    // Display in OpenCV window
+    cv::imshow(window_name, img_display);
+    cv::waitKey(1); // Non-blocking wait
+}
+
 } //namespace ORB_SLAM

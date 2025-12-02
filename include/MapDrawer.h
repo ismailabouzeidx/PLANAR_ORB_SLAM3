@@ -26,8 +26,11 @@
 #include "Settings.h"
 #include<pangolin/pangolin.h>
 #include<Eigen/Dense>
+#include<opencv2/core/core.hpp>
+#include<opencv2/imgproc/imgproc.hpp>
 
 #include<mutex>
+#include<string>
 
 namespace ORB_SLAM3
 {
@@ -84,6 +87,13 @@ public:
     // Get BEV image dimensions
     int GetBEVWidth() const { return m_bev_width; }
     int GetBEVHeight() const { return m_bev_height; }
+    
+    // Generate and display BEV image from a camera image and KeyFrame
+    // img: input camera image (will be warped to BEV)
+    // pKF: KeyFrame to use for pose and calibration
+    // window_name: OpenCV window name (default: "BEV View")
+    // max_display_size: maximum window size to fit on screen (default: 800 pixels)
+    void ShowBEVImage(const cv::Mat& img, KeyFrame* pKF, const std::string& window_name = "BEV View", int max_display_size = 800);
 
 protected:
 

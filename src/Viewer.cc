@@ -338,6 +338,45 @@ void Viewer::Run()
         cv::imshow("ORB-SLAM3: Current Frame",toShow);
         cv::waitKey(mT);
 
+        // Show BEV image if alignment is available
+        if (mpMapDrawer->HasAlignment() && mpMapDrawer->mpAtlas)
+        {
+            Map* pActiveMap = mpMapDrawer->mpAtlas->GetCurrentMap();
+            if (pActiveMap)
+            {
+                const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
+                if (!vpKFs.empty())
+                {
+                    // Use the most recent KeyFrame (first valid one)
+                    KeyFrame* pKF = nullptr;
+                    for (auto kf : vpKFs)
+                    {
+                        if (kf && !kf->isBad() && kf->mpCamera)
+                        {
+                            pKF = kf;
+                            break;
+                        }
+                    }
+                    
+                    if (pKF && mpTracker)
+                    {
+                        // Get the raw image from tracker
+                        cv::Mat im_raw;
+                        if (!mpTracker->mImGray.empty())
+                        {
+                            mpTracker->mImGray.copyTo(im_raw);
+                            // Convert to BGR if grayscale
+                            if (im_raw.channels() == 1)
+                            {
+                                cv::cvtColor(im_raw, im_raw, cv::COLOR_GRAY2BGR);
+                            }
+                            mpMapDrawer->ShowBEVImage(im_raw, pKF, "BEV View", 800);
+                        }
+                    }
+                }
+            }
+        }
+
         if(menuReset)
         {
             menuShowGraph = true;
