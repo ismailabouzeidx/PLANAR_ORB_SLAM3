@@ -25,6 +25,7 @@
 #include"KeyFrame.h"
 #include "Settings.h"
 #include<pangolin/pangolin.h>
+#include<Eigen/Dense>
 
 #include<mutex>
 
@@ -49,8 +50,13 @@ public:
     void SetCurrentCameraPose(const Sophus::SE3f &Tcw);
     void SetReferenceKeyFrame(KeyFrame *pKF);
     void GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M, pangolin::OpenGlMatrix &MOw);
+    void EstimateGroundPlane();
+    bool HasGroundPlane() const { return m_hasGroundPlane; }
+    bool HasAlignment() const { return m_hasAlignment; }
+    Eigen::Matrix3f GetAlignRotation() const { return m_R_align; }
+    Eigen::Vector3f GetAlignTranslation() const { return m_t_align; }
 
-private:
+protected:
 
     bool ParseViewerParamFile(cv::FileStorage &fSettings);
 
@@ -71,6 +77,19 @@ private:
                                 {0.6f, 0.0f, 1.0f},
                                 {1.0f, 1.0f, 0.0f},
                                 {0.0f, 1.0f, 1.0f}};
+
+    bool m_hasGroundPlane = false;
+    Eigen::Vector3f m_groundNormal;
+    float m_groundD = 0.0f;
+    Eigen::Vector3f m_groundCentroid;
+
+    bool m_hasAlignment = false;
+    Eigen::Matrix3f m_R_align = Eigen::Matrix3f::Identity();
+    Eigen::Vector3f m_t_align = Eigen::Vector3f::Zero();
+
+private:
+
+    void ComputeWorldAlignmentFromPlane();
 
 };
 

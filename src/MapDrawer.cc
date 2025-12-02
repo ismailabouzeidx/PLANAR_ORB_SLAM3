@@ -21,6 +21,65 @@
 #include "KeyFrame.h"
 #include <pangolin/pangolin.h>
 #include <mutex>
+#include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
+#include <Eigen/Geometry>
+#include <iostream>
+#include <cmath>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+namespace {
+
+// Simple least-squares plane fit: n·X + d = 0
+struct PlaneLSQ {
+    Eigen::Vector3f n; // unit normal
+    float d;
+    Eigen::Vector3f centroid;
+    float avgResidual = 0.0f;
+    float maxResidual = 0.0f;
+};
+
+PlaneLSQ fitPlaneLeastSquares(const std::vector<Eigen::Vector3f>& pts)
+{
+    PlaneLSQ plane;
+    // 1) centroid
+    Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
+    for (auto& p : pts) centroid += p;
+    centroid /= static_cast<float>(pts.size());
+    plane.centroid = centroid;
+
+    // 2) covariance
+    Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+    for (auto& p : pts) {
+        Eigen::Vector3f q = p - centroid;
+        cov += q * q.transpose();
+    }
+
+    // 3) smallest eigenvector = normal
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
+    plane.n = solver.eigenvectors().col(0); // smallest eigenvalue
+    plane.n.normalize();
+
+    // 4) d = -n·centroid
+    plane.d = -plane.n.dot(centroid);
+
+    // 5) compute residuals
+    float sumResidual = 0.0f;
+    float maxRes = 0.0f;
+    for (auto& p : pts) {
+        float dist = std::abs(plane.n.dot(p) + plane.d);
+        sumResidual += dist;
+        maxRes = std::max(maxRes, dist);
+    }
+    plane.avgResidual = sumResidual / static_cast<float>(pts.size());
+    plane.maxResidual = maxRes;
+
+    return plane;
+}
+
+} // anonymous namespace
 
 namespace ORB_SLAM3
 {
@@ -141,10 +200,15 @@ void MapDrawer::DrawMapPoints()
     const vector<MapPoint*> &vpMPs = pActiveMap->GetAllMapPoints();
     const vector<MapPoint*> &vpRefMPs = pActiveMap->GetReferenceMapPoints();
 
-    set<MapPoint*> spRefMPs(vpRefMPs.begin(), vpRefMPs.end());
-
     if(vpMPs.empty())
         return;
+
+    // --- NEW: estimate plane once when map is non-empty ---
+    if (!m_hasGroundPlane) {
+        EstimateGroundPlane();
+    }
+
+    set<MapPoint*> spRefMPs(vpRefMPs.begin(), vpRefMPs.end());
 
     glPointSize(mPointSize);
     glBegin(GL_POINTS);
@@ -154,8 +218,13 @@ void MapDrawer::DrawMapPoints()
     {
         if(vpMPs[i]->isBad() || spRefMPs.count(vpMPs[i]))
             continue;
-        Eigen::Matrix<float,3,1> pos = vpMPs[i]->GetWorldPos();
-        glVertex3f(pos(0),pos(1),pos(2));
+        Eigen::Vector3f pos = vpMPs[i]->GetWorldPos();
+
+        if (m_hasAlignment) {
+            pos = m_R_align * pos + m_t_align;
+        }
+
+        glVertex3f(pos(0), pos(1), pos(2));
     }
     glEnd();
 
@@ -167,12 +236,43 @@ void MapDrawer::DrawMapPoints()
     {
         if((*sit)->isBad())
             continue;
-        Eigen::Matrix<float,3,1> pos = (*sit)->GetWorldPos();
-        glVertex3f(pos(0),pos(1),pos(2));
+        Eigen::Vector3f pos = (*sit)->GetWorldPos();
+
+        if (m_hasAlignment) {
+            pos = m_R_align * pos + m_t_align;
+        }
+
+        glVertex3f(pos(0), pos(1), pos(2));
 
     }
 
     glEnd();
+
+    // === Draw ground plane grid (aligned) ===
+    if (m_hasAlignment)
+    {
+        float halfSize = 5.0f;
+        int steps = 10;
+
+        glLineWidth(1.0f);
+        glColor3f(0.0f, 1.0f, 0.0f);
+        glBegin(GL_LINES);
+
+        for (int i=-steps; i<=steps; ++i)
+        {
+            float alpha = halfSize * float(i) / float(steps);
+
+            // lines along X'
+            glVertex3f(alpha, 0.0f, -halfSize);
+            glVertex3f(alpha, 0.0f,  halfSize);
+
+            // lines along Z'
+            glVertex3f(-halfSize, 0.0f, alpha);
+            glVertex3f( halfSize, 0.0f, alpha);
+        }
+
+        glEnd();
+    }
 }
 
 void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba)
@@ -191,12 +291,35 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
 
     const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
 
+    // Debug: print heights of a few keyframe camera centers
+    if (m_hasAlignment && !vpKFs.empty())
+    {
+        int numToPrint = std::min(5, static_cast<int>(vpKFs.size()));
+        std::cout << "[MapDrawer] KeyFrame heights (aligned Y coordinate):" << std::endl;
+        for (int i = 0; i < numToPrint; ++i)
+        {
+            KeyFrame* pKF = vpKFs[i];
+            Eigen::Vector3f Ow = pKF->GetCameraCenter();
+            Eigen::Vector3f Ow_aligned = m_R_align * Ow + m_t_align;
+            float h = Ow_aligned.y();
+            std::cout << "  KF[" << i << "] (id=" << pKF->mnId << "): h = " << h << std::endl;
+        }
+    }
+
     if(bDrawKF)
     {
         for(size_t i=0; i<vpKFs.size(); i++)
         {
             KeyFrame* pKF = vpKFs[i];
             Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
+
+            if (m_hasAlignment) {
+                Eigen::Matrix4f T_align = Eigen::Matrix4f::Identity();
+                T_align.block<3,3>(0,0) = m_R_align;
+                T_align.block<3,1>(0,3) = m_t_align;
+                Twc = T_align * Twc;
+            }
+
             unsigned int index_color = pKF->mnOriginMapId;
 
             glPushMatrix();
@@ -274,6 +397,9 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             // Covisibility Graph
             const vector<KeyFrame*> vCovKFs = vpKFs[i]->GetCovisiblesByWeight(100);
             Eigen::Vector3f Ow = vpKFs[i]->GetCameraCenter();
+            if (m_hasAlignment) {
+                Ow = m_R_align * Ow + m_t_align;
+            }
             if(!vCovKFs.empty())
             {
                 for(vector<KeyFrame*>::const_iterator vit=vCovKFs.begin(), vend=vCovKFs.end(); vit!=vend; vit++)
@@ -281,6 +407,9 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
                     if((*vit)->mnId<vpKFs[i]->mnId)
                         continue;
                     Eigen::Vector3f Ow2 = (*vit)->GetCameraCenter();
+                    if (m_hasAlignment) {
+                        Ow2 = m_R_align * Ow2 + m_t_align;
+                    }
                     glVertex3f(Ow(0),Ow(1),Ow(2));
                     glVertex3f(Ow2(0),Ow2(1),Ow2(2));
                 }
@@ -291,6 +420,9 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             if(pParent)
             {
                 Eigen::Vector3f Owp = pParent->GetCameraCenter();
+                if (m_hasAlignment) {
+                    Owp = m_R_align * Owp + m_t_align;
+                }
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owp(0),Owp(1),Owp(2));
             }
@@ -302,6 +434,9 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
                 if((*sit)->mnId<vpKFs[i]->mnId)
                     continue;
                 Eigen::Vector3f Owl = (*sit)->GetCameraCenter();
+                if (m_hasAlignment) {
+                    Owl = m_R_align * Owl + m_t_align;
+                }
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owl(0),Owl(1),Owl(2));
             }
@@ -321,10 +456,16 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
         {
             KeyFrame* pKFi = vpKFs[i];
             Eigen::Vector3f Ow = pKFi->GetCameraCenter();
+            if (m_hasAlignment) {
+                Ow = m_R_align * Ow + m_t_align;
+            }
             KeyFrame* pNext = pKFi->mNextKF;
             if(pNext)
             {
                 Eigen::Vector3f Owp = pNext->GetCameraCenter();
+                if (m_hasAlignment) {
+                    Owp = m_R_align * Owp + m_t_align;
+                }
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owp(0),Owp(1),Owp(2));
             }
@@ -348,6 +489,14 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             {
                 KeyFrame* pKF = vpKFs[i];
                 Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
+
+                if (m_hasAlignment) {
+                    Eigen::Matrix4f T_align = Eigen::Matrix4f::Identity();
+                    T_align.block<3,3>(0,0) = m_R_align;
+                    T_align.block<3,1>(0,3) = m_t_align;
+                    Twc = T_align * Twc;
+                }
+
                 unsigned int index_color = pKF->mnOriginMapId;
 
                 glPushMatrix();
@@ -464,4 +613,83 @@ void MapDrawer::GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M, pangolin
     MOw.m[13] = Twc(1,3);
     MOw.m[14] = Twc(2,3);
 }
+
+void MapDrawer::EstimateGroundPlane()
+{
+    Map* pActiveMap = mpAtlas->GetCurrentMap();
+    if (!pActiveMap) return;
+
+    const vector<MapPoint*> &vpMPs = pActiveMap->GetAllMapPoints();
+    if (vpMPs.empty()) return;
+
+    std::vector<Eigen::Vector3f> pts;
+    pts.reserve(vpMPs.size());
+
+    for (auto pMP : vpMPs)
+    {
+        if (!pMP || pMP->isBad()) continue;
+
+        Eigen::Vector3f pos = pMP->GetWorldPos();
+
+        if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z()))
+            continue;
+
+        pts.push_back(pos);
+    }
+
+    if (pts.size() < 50) {
+        std::cout << "[MapDrawer] Not enough points to estimate ground plane." << std::endl;
+        return;
+    }
+
+    PlaneLSQ plane = fitPlaneLeastSquares(pts);
+
+    m_groundNormal   = plane.n;
+    m_groundD        = plane.d;
+    m_groundCentroid = plane.centroid;
+    m_hasGroundPlane = true;
+
+    // diagnostics (optional)
+    Eigen::Vector3f up(0.0f, 1.0f, 0.0f);
+    float cosTheta = plane.n.dot(up);
+    cosTheta = std::max(-1.0f, std::min(1.0f, cosTheta));
+    float angleDeg = std::acos(cosTheta) * 180.0f / static_cast<float>(M_PI);
+
+    std::cout << "[MapDrawer] Ground plane estimated:\n"
+              << "  n = [" << m_groundNormal.transpose() << "]\n"
+              << "  d = " << m_groundD << "\n"
+              << "  centroid = [" << plane.centroid.transpose() << "]\n"
+              << "  avg residual = " << plane.avgResidual
+              << ", max residual = " << plane.maxResidual << "\n"
+              << "  angle to +Y axis = " << angleDeg << " deg" << std::endl;
+
+    // NEW: compute alignment (normal -> +Y, plane -> Y=0)
+    ComputeWorldAlignmentFromPlane();
+}
+
+void MapDrawer::ComputeWorldAlignmentFromPlane()
+{
+    if (!m_hasGroundPlane)
+        return;
+
+    // 1. rotation: ground normal -> +Y
+    Eigen::Vector3f up(0.0f, 1.0f, 0.0f);
+    Eigen::Quaternionf q = Eigen::Quaternionf::FromTwoVectors(m_groundNormal, up);
+    m_R_align = q.toRotationMatrix();
+
+    // 2. translation: send plane to Y=0 using centroid as reference point
+    //    X0 is a point on the plane in original world
+    Eigen::Vector3f X0 = m_groundCentroid;
+    Eigen::Vector3f X0_rot = m_R_align * X0; // in aligned frame
+
+    float y_shift = -X0_rot.y(); // so that this point ends up at Y=0
+    m_t_align = Eigen::Vector3f(0.0f, y_shift, 0.0f);
+
+    m_hasAlignment = true;
+
+    std::cout << "[MapDrawer] Alignment computed:\n"
+              << "  R_align = \n" << m_R_align << "\n"
+              << "  t_align = [" << m_t_align.transpose() << "]" << std::endl;
+}
+
 } //namespace ORB_SLAM
