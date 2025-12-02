@@ -304,6 +304,41 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             float h = Ow_aligned.y();
             std::cout << "  KF[" << i << "] (id=" << pKF->mnId << "): h = " << h << std::endl;
         }
+        
+        // Test PixelToGround on first KeyFrame
+        if (!vpKFs.empty() && vpKFs[0]->mpCamera)
+        {
+            KeyFrame* pKF = vpKFs[0];
+            Eigen::Matrix3f K = pKF->mpCamera->toK_();
+            float cx = K(0, 2);
+            float cy = K(1, 2);
+            
+            // Test a few pixels: center, and some corners
+            std::vector<std::pair<float, float>> test_pixels = {
+                {cx, cy},           // image center
+                {cx - 100, cy},     // left of center
+                {cx + 100, cy},     // right of center
+                {cx, cy - 100},     // above center
+                {cx, cy + 100}      // below center
+            };
+            
+            std::cout << "[MapDrawer] Testing PixelToGround (KF id=" << pKF->mnId << "):" << std::endl;
+            for (const auto& pixel : test_pixels)
+            {
+                float u = pixel.first;
+                float v = pixel.second;
+                float X_ground, Z_ground;
+                if (PixelToGround(pKF, u, v, X_ground, Z_ground))
+                {
+                    std::cout << "  Pixel (" << u << ", " << v << ") -> ground (X, Z) = ("
+                              << X_ground << ", " << Z_ground << ") [aligned meters]" << std::endl;
+                }
+                else
+                {
+                    std::cout << "  Pixel (" << u << ", " << v << ") -> invalid (behind camera or at infinity)" << std::endl;
+                }
+            }
+        }
     }
 
     if(bDrawKF)
@@ -690,6 +725,97 @@ void MapDrawer::ComputeWorldAlignmentFromPlane()
     std::cout << "[MapDrawer] Alignment computed:\n"
               << "  R_align = \n" << m_R_align << "\n"
               << "  t_align = [" << m_t_align.transpose() << "]" << std::endl;
+}
+
+void MapDrawer::GetAlignedCameraPose(KeyFrame* pKF, Eigen::Matrix3f& R_cw, Eigen::Vector3f& t_cw)
+{
+    if (!m_hasAlignment || !pKF) {
+        // If no alignment, return original pose
+        Sophus::SE3f Tcw = pKF->GetPose();
+        R_cw = Tcw.rotationMatrix();
+        t_cw = Tcw.translation();
+        return;
+    }
+
+    // STEP 1: Get camera pose in the aligned world frame
+    // 1) Original world->camera pose from ORB-SLAM3
+    Sophus::SE3f Tcw = pKF->GetPose();    // camera from world
+    Eigen::Matrix4f Tcw_mat = Tcw.matrix();
+
+    // 2) Camera->world (Twc) in original SLAM world
+    Eigen::Matrix4f Twc = Tcw.inverse().matrix();
+
+    // 3) Build alignment transform T_align (same as in MapDrawer)
+    Eigen::Matrix4f T_align = Eigen::Matrix4f::Identity();
+    T_align.block<3,3>(0,0) = m_R_align;
+    T_align.block<3,1>(0,3) = m_t_align;
+
+    // 4) Camera->world in the **aligned** frame
+    Eigen::Matrix4f Twc_aligned = T_align * Twc;
+
+    // 5) Extract R_wc' and t_wc'
+    Eigen::Matrix3f R_wc = Twc_aligned.block<3,3>(0,0);
+    Eigen::Vector3f t_wc = Twc_aligned.block<3,1>(0,3);
+
+    // 6) Convert back to world->camera in aligned frame
+    R_cw = R_wc.transpose();
+    t_cw = -R_cw * t_wc;
+}
+
+bool MapDrawer::ComputeGroundHomography(KeyFrame* pKF, Eigen::Matrix3f& H_plane2img, Eigen::Matrix3f& H_img2ground)
+{
+    if (!m_hasAlignment || !pKF || !pKF->mpCamera) {
+        return false;
+    }
+
+    // Get camera intrinsic matrix K
+    Eigen::Matrix3f K = pKF->mpCamera->toK_();
+
+    // Get aligned camera pose
+    Eigen::Matrix3f R_cw;
+    Eigen::Vector3f t_cw;
+    GetAlignedCameraPose(pKF, R_cw, t_cw);
+
+    // STEP 3: Build plane→image homography
+    // H_plane2img = [K*r1  K*r3  K*t_cw]
+    // where r1 = R_cw.col(0) and r3 = R_cw.col(2)
+    H_plane2img.col(0) = K * R_cw.col(0);  // X direction
+    H_plane2img.col(1) = K * R_cw.col(2);  // Z direction
+    H_plane2img.col(2) = K * t_cw;         // translation offset
+
+    // STEP 4: Invert to get image→ground homography
+    H_img2ground = H_plane2img.inverse();
+
+    return true;
+}
+
+bool MapDrawer::PixelToGround(KeyFrame* pKF, float u, float v, float& X_ground, float& Z_ground)
+{
+    if (!m_hasAlignment || !pKF) {
+        return false;
+    }
+
+    // Compute homographies
+    Eigen::Matrix3f H_plane2img, H_img2ground;
+    if (!ComputeGroundHomography(pKF, H_plane2img, H_img2ground)) {
+        return false;
+    }
+
+    // Convert pixel to ground coordinates
+    Eigen::Vector3f uv1(u, v, 1.0f);
+    Eigen::Vector3f XZ1 = H_img2ground * uv1;
+    
+    // Normalize by homogeneous coordinate
+    if (std::abs(XZ1(2)) < 1e-6f) {
+        return false; // Invalid (point at infinity or behind camera)
+    }
+    
+    XZ1 /= XZ1(2);
+
+    X_ground = XZ1(0);  // X coordinate in aligned world (meters)
+    Z_ground = XZ1(1);  // Z coordinate in aligned world (meters)
+
+    return true;
 }
 
 } //namespace ORB_SLAM

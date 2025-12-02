@@ -55,6 +55,22 @@ public:
     bool HasAlignment() const { return m_hasAlignment; }
     Eigen::Matrix3f GetAlignRotation() const { return m_R_align; }
     Eigen::Vector3f GetAlignTranslation() const { return m_t_align; }
+    
+    // Get aligned camera pose (world->camera) for a KeyFrame
+    // Returns: (R_cw, t_cw) where R_cw is rotation and t_cw is translation
+    // R_cw: aligned world -> camera rotation (3x3)
+    // t_cw: origin of aligned world expressed in camera frame (3x1)
+    void GetAlignedCameraPose(KeyFrame* pKF, Eigen::Matrix3f& R_cw, Eigen::Vector3f& t_cw);
+    
+    // Compute homography from ground plane to image for a KeyFrame
+    // H_plane2img: 3x3 matrix mapping [X, Z, 1]^T (ground coords) to [u, v, 1]^T (pixel coords)
+    // H_img2ground: 3x3 matrix mapping [u, v, 1]^T (pixel coords) to [X, Z, 1]^T (ground coords)
+    bool ComputeGroundHomography(KeyFrame* pKF, Eigen::Matrix3f& H_plane2img, Eigen::Matrix3f& H_img2ground);
+    
+    // Convert pixel coordinates to ground plane coordinates (in aligned world meters)
+    // Returns true if successful, false if alignment not available
+    // X_ground, Z_ground: ground coordinates in meters (Y = 0 in aligned frame)
+    bool PixelToGround(KeyFrame* pKF, float u, float v, float& X_ground, float& Z_ground);
 
 protected:
 
