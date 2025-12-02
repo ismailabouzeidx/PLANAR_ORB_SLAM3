@@ -71,6 +71,19 @@ public:
     // Returns true if successful, false if alignment not available
     // X_ground, Z_ground: ground coordinates in meters (Y = 0 in aligned frame)
     bool PixelToGround(KeyFrame* pKF, float u, float v, float& X_ground, float& Z_ground);
+    
+    // BEV (Bird's Eye View) functions
+    // Set BEV window parameters (in aligned world meters)
+    void SetBEVWindow(float X_min, float X_max, float Z_min, float Z_max, float pixels_per_meter = 80.0f);
+    
+    // Compute homography from image to BEV for a KeyFrame
+    // H_img2bev: 3x3 matrix mapping [u, v, 1]^T (pixel coords) to [u_bev, v_bev, 1]^T (BEV pixel coords)
+    // Returns true if successful, false if alignment not available
+    bool ComputeBEVHomography(KeyFrame* pKF, Eigen::Matrix3f& H_img2bev);
+    
+    // Get BEV image dimensions
+    int GetBEVWidth() const { return m_bev_width; }
+    int GetBEVHeight() const { return m_bev_height; }
 
 protected:
 
@@ -102,6 +115,15 @@ protected:
     bool m_hasAlignment = false;
     Eigen::Matrix3f m_R_align = Eigen::Matrix3f::Identity();
     Eigen::Vector3f m_t_align = Eigen::Vector3f::Zero();
+
+    // BEV parameters
+    float m_bev_X_min = -2.0f;
+    float m_bev_X_max = 2.0f;
+    float m_bev_Z_min = 0.0f;
+    float m_bev_Z_max = 6.0f;
+    float m_bev_pixels_per_meter = 80.0f;
+    int m_bev_width = 0;
+    int m_bev_height = 0;
 
 private:
 

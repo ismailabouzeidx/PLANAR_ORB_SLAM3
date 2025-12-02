@@ -107,6 +107,10 @@ MapDrawer::MapDrawer(Atlas* pAtlas, const string &strSettingPath, Settings* sett
             }
         }
     }
+    
+    // Initialize BEV dimensions from default parameters
+    m_bev_width = static_cast<int>((m_bev_X_max - m_bev_X_min) * m_bev_pixels_per_meter);
+    m_bev_height = static_cast<int>((m_bev_Z_max - m_bev_Z_min) * m_bev_pixels_per_meter);
 }
 
 void MapDrawer::newParameterLoader(Settings *settings) {
@@ -336,6 +340,32 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
                 else
                 {
                     std::cout << "  Pixel (" << u << ", " << v << ") -> invalid (behind camera or at infinity)" << std::endl;
+                }
+            }
+            
+            // Test BEV homography
+            Eigen::Matrix3f H_img2bev;
+            if (ComputeBEVHomography(pKF, H_img2bev))
+            {
+                std::cout << "[MapDrawer] BEV homography computed (KF id=" << pKF->mnId << "):" << std::endl;
+                std::cout << "  BEV window: X=[" << m_bev_X_min << ", " << m_bev_X_max 
+                          << "], Z=[" << m_bev_Z_min << ", " << m_bev_Z_max << "]" << std::endl;
+                std::cout << "  BEV image size: " << m_bev_width << "x" << m_bev_height 
+                          << " pixels (" << m_bev_pixels_per_meter << " px/m)" << std::endl;
+                
+                // Test a few pixels -> BEV coordinates
+                for (const auto& pixel : test_pixels)
+                {
+                    float u = pixel.first;
+                    float v = pixel.second;
+                    Eigen::Vector3f uv1(u, v, 1.0f);
+                    Eigen::Vector3f bev = H_img2bev * uv1;
+                    if (std::abs(bev(2)) > 1e-6f)
+                    {
+                        bev /= bev(2);
+                        std::cout << "  Pixel (" << u << ", " << v << ") -> BEV (" 
+                                  << bev(0) << ", " << bev(1) << ")" << std::endl;
+                    }
                 }
             }
         }
@@ -814,6 +844,50 @@ bool MapDrawer::PixelToGround(KeyFrame* pKF, float u, float v, float& X_ground, 
 
     X_ground = XZ1(0);  // X coordinate in aligned world (meters)
     Z_ground = XZ1(1);  // Z coordinate in aligned world (meters)
+
+    return true;
+}
+
+void MapDrawer::SetBEVWindow(float X_min, float X_max, float Z_min, float Z_max, float pixels_per_meter)
+{
+    m_bev_X_min = X_min;
+    m_bev_X_max = X_max;
+    m_bev_Z_min = Z_min;
+    m_bev_Z_max = Z_max;
+    m_bev_pixels_per_meter = pixels_per_meter;
+    
+    // Compute BEV image dimensions
+    m_bev_width = static_cast<int>((X_max - X_min) * pixels_per_meter);
+    m_bev_height = static_cast<int>((Z_max - Z_min) * pixels_per_meter);
+}
+
+bool MapDrawer::ComputeBEVHomography(KeyFrame* pKF, Eigen::Matrix3f& H_img2bev)
+{
+    if (!m_hasAlignment || !pKF) {
+        return false;
+    }
+
+    // Get image->ground homography
+    Eigen::Matrix3f H_plane2img, H_img2ground;
+    if (!ComputeGroundHomography(pKF, H_plane2img, H_img2ground)) {
+        return false;
+    }
+
+    // Build world→BEV transform T_bev
+    // X = X_min → u_bev = 0
+    // X = X_max → u_bev = bev_width
+    // Z = Z_max → v_bev = 0     (far = top)
+    // Z = Z_min → v_bev = bev_height  (near = bottom)
+    float s = m_bev_pixels_per_meter;
+    
+    Eigen::Matrix3f T_bev = Eigen::Matrix3f::Identity();
+    T_bev <<
+        s,    0,  -s * m_bev_X_min,
+        0,   -s,   s * m_bev_Z_max,
+        0,    0,   1;
+
+    // Compose: image → ground → BEV
+    H_img2bev = T_bev * H_img2ground;
 
     return true;
 }
