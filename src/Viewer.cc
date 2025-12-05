@@ -347,14 +347,15 @@ void Viewer::Run()
                 const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
                 if (!vpKFs.empty())
                 {
-                    // Use the most recent KeyFrame (first valid one)
+                    // Use the most recent KeyFrame (highest ID) for display
                     KeyFrame* pKF = nullptr;
+                    unsigned long maxId = 0;
                     for (auto kf : vpKFs)
                     {
-                        if (kf && !kf->isBad() && kf->mpCamera)
+                        if (kf && !kf->isBad() && kf->mpCamera && kf->mnId > maxId)
                         {
                             pKF = kf;
-                            break;
+                            maxId = kf->mnId;
                         }
                     }
                     
@@ -370,7 +371,11 @@ void Viewer::Run()
                             {
                                 cv::cvtColor(im_raw, im_raw, cv::COLOR_GRAY2BGR);
                             }
+                            // Display BEV for the most recent keyframe
                             mpMapDrawer->ShowBEVImage(im_raw, pKF, "BEV View", 800);
+                            
+                            // Save BEV for the current keyframe (only when it matches the current image)
+                            mpMapDrawer->SaveAllKeyframeBEVs(im_raw, pKF);
                         }
                     }
                 }

@@ -872,66 +872,246 @@ bool MapDrawer::ComputeBEVHomography(KeyFrame* pKF, Eigen::Matrix3f& H_img2bev)
     if (!ComputeGroundHomography(pKF, H_plane2img, H_img2ground)) {
         return false;
     }
+    
+    // Validate homography values
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(H_img2ground(r, c)) || std::abs(H_img2ground(r, c)) > 1e6) {
+                return false;
+            }
+        }
+    }
 
+    // Get camera position in aligned world coordinates
+    Eigen::Matrix3f R_cw;
+    Eigen::Vector3f t_cw;
+    GetAlignedCameraPose(pKF, R_cw, t_cw);
+    
+    // Validate camera pose
+    if (!std::isfinite(t_cw(0)) || !std::isfinite(t_cw(1)) || !std::isfinite(t_cw(2))) {
+        return false;
+    }
+    
+    // Camera position in aligned world (world->camera, so invert to get camera->world)
+    Eigen::Matrix3f R_wc = R_cw.transpose();
+    Eigen::Vector3f t_wc = -R_wc * t_cw;
+    
+    // Camera's Z position in aligned world coordinates
+    float camera_Z = t_wc(2);  // Z coordinate of camera in aligned world
+    
+    // Validate camera Z position
+    if (!std::isfinite(camera_Z)) {
+        return false;
+    }
+    
+    // Make BEV window relative to camera position
+    // m_bev_Z_min and m_bev_Z_max are now interpreted as offsets from camera
+    float Z_min_abs = camera_Z + m_bev_Z_min;  // Near distance from camera
+    float Z_max_abs = camera_Z + m_bev_Z_max;  // Far distance from camera
+    
+    // Validate Z bounds
+    if (!std::isfinite(Z_min_abs) || !std::isfinite(Z_max_abs) || Z_min_abs >= Z_max_abs) {
+        return false;
+    }
+    
     // Build world→BEV transform T_bev
     // X = X_min → u_bev = 0
     // X = X_max → u_bev = bev_width
-    // Z = Z_max → v_bev = 0     (far = top)
-    // Z = Z_min → v_bev = bev_height  (near = bottom)
+    // Z = Z_max_abs → v_bev = 0     (far = top)
+    // Z = Z_min_abs → v_bev = bev_height  (near = bottom)
     float s = m_bev_pixels_per_meter;
+    
+    if (!std::isfinite(s) || s <= 0 || s > 10000) {
+        return false;
+    }
     
     Eigen::Matrix3f T_bev = Eigen::Matrix3f::Identity();
     T_bev <<
         s,    0,  -s * m_bev_X_min,
-        0,   -s,   s * m_bev_Z_max,
+        0,   -s,   s * Z_max_abs,
         0,    0,   1;
 
     // Compose: image → ground → BEV
     H_img2bev = T_bev * H_img2ground;
+    
+    // Final validation of result
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(H_img2bev(r, c)) || std::abs(H_img2bev(r, c)) > 1e6) {
+                return false;
+            }
+        }
+    }
 
     return true;
 }
 
 void MapDrawer::ShowBEVImage(const cv::Mat& img, KeyFrame* pKF, const std::string& window_name, int max_display_size)
 {
-    if (!m_hasAlignment || !pKF || img.empty()) {
-        std::cerr << "[MapDrawer] Cannot show BEV: alignment not available or invalid input" << std::endl;
+    // if (!m_hasAlignment || !pKF || img.empty()) {
+    //     std::cerr << "[MapDrawer] Cannot show BEV: alignment not available or invalid input" << std::endl;
+    //     return;
+    // }
+
+    // // Compute BEV homography
+    // Eigen::Matrix3f H_img2bev;
+    // if (!ComputeBEVHomography(pKF, H_img2bev)) {
+    //     std::cerr << "[MapDrawer] Failed to compute BEV homography" << std::endl;
+    //     return;
+    // }
+
+    // // Convert Eigen matrix to OpenCV Mat
+    // cv::Mat H_cv(3, 3, CV_32F);
+    // for (int r = 0; r < 3; ++r) {
+    //     for (int c = 0; c < 3; ++c) {
+    //         H_cv.at<float>(r, c) = H_img2bev(r, c);
+    //     }
+    // }
+
+    // // Warp image to BEV (use INTER_CUBIC for better quality at higher resolution)
+    // cv::Mat img_bev;
+    // cv::warpPerspective(img, img_bev, H_cv, cv::Size(m_bev_width, m_bev_height),
+    //                     cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+
+    // // Display original full-size BEV
+    // // cv::imshow("BEV View (Original)", img_bev);
+    // // Resize to fit screen if needed
+    // cv::Mat img_display = img_bev;
+    // if (m_bev_width > max_display_size || m_bev_height > max_display_size) {
+    //     float scale = std::min(static_cast<float>(max_display_size) / m_bev_width,
+    //                           static_cast<float>(max_display_size) / m_bev_height);
+    //     int new_w = static_cast<int>(m_bev_width * scale);
+    //     int new_h = static_cast<int>(m_bev_height * scale);
+    //     cv::resize(img_bev, img_display, cv::Size(new_w, new_h), 0, 0, cv::INTER_AREA);
+    // }
+
+    // Display resized BEV in the specified window
+    // cv::imshow(window_name, img_display);
+    // cv::waitKey(1); // Non-blocking wait
+}
+
+void MapDrawer::SaveAllKeyframeBEVs(const cv::Mat& current_img, KeyFrame* pCurrentKF)
+{
+    if (!m_hasAlignment || current_img.empty() || !mpAtlas || !pCurrentKF) {
         return;
     }
-
-    // Compute BEV homography
+    
+    // Validate input image dimensions
+    if (current_img.cols <= 0 || current_img.rows <= 0 || 
+        current_img.cols > 10000 || current_img.rows > 10000) {
+        return;
+    }
+    
+    // Only save BEV for the current keyframe (the one that matches the current image)
+    // We can't use the current image for older keyframes because their poses don't match
+    std::lock_guard<std::mutex> lock(mMutexSavedBEV);
+    
+    // Skip if already saved (check again after acquiring lock)
+    if (m_saved_bev_keyframes.find(pCurrentKF->mnId) != m_saved_bev_keyframes.end()) {
+        return;
+    }
+    
+    // Validate keyframe is still valid
+    if (pCurrentKF->isBad() || !pCurrentKF->mpCamera) {
+        return;
+    }
+    
+    // Recalculate BEV dimensions to ensure they're up to date
+    m_bev_width = static_cast<int>((m_bev_X_max - m_bev_X_min) * m_bev_pixels_per_meter);
+    m_bev_height = static_cast<int>((m_bev_Z_max - m_bev_Z_min) * m_bev_pixels_per_meter);
+    
+    // Validate BEV dimensions to prevent malloc crashes - use more conservative limits
+    if (m_bev_width <= 0 || m_bev_height <= 0 || 
+        m_bev_width > 10000 || m_bev_height > 10000 ||
+        !std::isfinite(static_cast<float>(m_bev_width)) || !std::isfinite(static_cast<float>(m_bev_height))) {
+        return;
+    }
+    
+    // Compute BEV homography for the current keyframe
     Eigen::Matrix3f H_img2bev;
-    if (!ComputeBEVHomography(pKF, H_img2bev)) {
-        std::cerr << "[MapDrawer] Failed to compute BEV homography" << std::endl;
+    if (!ComputeBEVHomography(pCurrentKF, H_img2bev)) {
         return;
     }
-
-    // Convert Eigen matrix to OpenCV Mat
+    
+    // Convert Eigen matrix to OpenCV Mat and validate
     cv::Mat H_cv(3, 3, CV_32F);
+    bool valid_h = true;
     for (int r = 0; r < 3; ++r) {
         for (int c = 0; c < 3; ++c) {
-            H_cv.at<float>(r, c) = H_img2bev(r, c);
+            float val = H_img2bev(r, c);
+            if (!std::isfinite(val) || std::abs(val) > 1e6) {
+                valid_h = false;
+                break;
+            }
+            H_cv.at<float>(r, c) = val;
         }
+        if (!valid_h) break;
     }
-
-    // Warp image to BEV
+    
+    if (!valid_h) {
+        return;
+    }
+    
+    // Prepare image (convert to BGR if needed) - do this after validation to save memory
+    cv::Mat im_bgr;
+    if (current_img.channels() == 1) {
+        try {
+            cv::cvtColor(current_img, im_bgr, cv::COLOR_GRAY2BGR);
+        } catch (const cv::Exception& e) {
+            return;
+        }
+    } else {
+        im_bgr = current_img.clone();
+    }
+    
+    if (im_bgr.empty() || im_bgr.cols != current_img.cols || im_bgr.rows != current_img.rows) {
+        return;
+    }
+    
+    // Pre-allocate BEV image with validated dimensions - use create() for safety
     cv::Mat img_bev;
-    cv::warpPerspective(img, img_bev, H_cv, cv::Size(m_bev_width, m_bev_height),
-                        cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-
-    // Resize to fit screen if needed
-    cv::Mat img_display = img_bev;
-    if (m_bev_width > max_display_size || m_bev_height > max_display_size) {
-        float scale = std::min(static_cast<float>(max_display_size) / m_bev_width,
-                              static_cast<float>(max_display_size) / m_bev_height);
-        int new_w = static_cast<int>(m_bev_width * scale);
-        int new_h = static_cast<int>(m_bev_height * scale);
-        cv::resize(img_bev, img_display, cv::Size(new_w, new_h), 0, 0, cv::INTER_AREA);
+    try {
+        img_bev.create(m_bev_height, m_bev_width, CV_8UC3);
+        img_bev.setTo(cv::Scalar(0, 0, 0));
+    } catch (const cv::Exception& e) {
+        return;
+    } catch (const std::bad_alloc& e) {
+        return;
     }
-
-    // Display in OpenCV window
-    cv::imshow(window_name, img_display);
-    cv::waitKey(1); // Non-blocking wait
+    
+    // Validate allocation succeeded
+    if (img_bev.empty() || img_bev.cols != m_bev_width || img_bev.rows != m_bev_height) {
+        return;
+    }
+    
+    // Warp image to BEV (use INTER_LINEAR for large images to reduce memory usage)
+    try {
+        cv::warpPerspective(im_bgr, img_bev, H_cv, cv::Size(m_bev_width, m_bev_height),
+                            cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    } catch (const cv::Exception& e) {
+        return; // Skip if warping fails
+    } catch (const std::bad_alloc& e) {
+        return;
+    }
+    
+    // Validate warped image
+    if (img_bev.empty() || img_bev.cols != m_bev_width || img_bev.rows != m_bev_height) {
+        return;
+    }
+    
+    // Save the BEV image
+    std::string bev_filename = "/home/ismo/data/orb_slam_bev/" + std::to_string(pCurrentKF->mnId) + ".png";
+    try {
+        // Clone before saving to ensure data integrity
+        cv::Mat img_to_save = img_bev.clone();
+        if (!img_to_save.empty() && cv::imwrite(bev_filename, img_to_save)) {
+            m_saved_bev_keyframes.insert(pCurrentKF->mnId);
+        }
+    } catch (const cv::Exception& e) {
+        // Skip if saving fails
+    } catch (const std::bad_alloc& e) {
+        // Skip if memory allocation fails
+    }
 }
 
 } //namespace ORB_SLAM

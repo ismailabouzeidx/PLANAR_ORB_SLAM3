@@ -77,7 +77,7 @@ public:
     
     // BEV (Bird's Eye View) functions
     // Set BEV window parameters (in aligned world meters)
-    void SetBEVWindow(float X_min, float X_max, float Z_min, float Z_max, float pixels_per_meter = 80.0f);
+    void SetBEVWindow(float X_min, float X_max, float Z_min, float Z_max, float pixels_per_meter = 300.0f);
     
     // Compute homography from image to BEV for a KeyFrame
     // H_img2bev: 3x3 matrix mapping [u, v, 1]^T (pixel coords) to [u_bev, v_bev, 1]^T (BEV pixel coords)
@@ -93,7 +93,9 @@ public:
     // pKF: KeyFrame to use for pose and calibration
     // window_name: OpenCV window name (default: "BEV View")
     // max_display_size: maximum window size to fit on screen (default: 800 pixels)
-    void ShowBEVImage(const cv::Mat& img, KeyFrame* pKF, const std::string& window_name = "BEV View", int max_display_size = 800);
+           void ShowBEVImage(const cv::Mat& img, KeyFrame* pKF, const std::string& window_name = "BEV View", int max_display_size = 800);
+           
+           void SaveAllKeyframeBEVs(const cv::Mat& current_img, KeyFrame* pCurrentKF);
 
 protected:
 
@@ -129,11 +131,15 @@ protected:
     // BEV parameters
     float m_bev_X_min = -2.0f;
     float m_bev_X_max = 2.0f;
-    float m_bev_Z_min = 0.0f;
-    float m_bev_Z_max = 6.0f;
-    float m_bev_pixels_per_meter = 80.0f;
+    float m_bev_Z_min = 2.0f;
+    float m_bev_Z_max = 4.0f;
+    float m_bev_pixels_per_meter = 300.0f;  // Increased from 80 for higher resolution
     int m_bev_width = 0;
     int m_bev_height = 0;
+    
+    // Track which keyframes have had their BEV saved (to avoid saving multiple times)
+    std::set<unsigned long> m_saved_bev_keyframes;
+    std::mutex mMutexSavedBEV; // Mutex for thread-safe access to m_saved_bev_keyframes
 
 private:
 
