@@ -67,6 +67,7 @@ src/KeyFrame.cc
 src/Atlas.cc
 src/Map.cc
 src/MapDrawer.cc
+src/BEVGenerator.cc
 src/Optimizer.cc
 src/Frame.cc
 src/KeyFrameDatabase.cc
@@ -95,6 +96,7 @@ include/KeyFrame.h
 include/Atlas.h
 include/Map.h
 include/MapDrawer.h
+include/BEVGenerator.h
 include/Optimizer.h
 include/Frame.h
 include/KeyFrameDatabase.h

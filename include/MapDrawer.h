@@ -32,6 +32,11 @@
 #include<mutex>
 #include<string>
 
+// Forward declaration
+namespace ORB_SLAM3 {
+    class BEVGenerator;
+}
+
 namespace ORB_SLAM3
 {
 
@@ -42,6 +47,7 @@ class MapDrawer
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     MapDrawer(Atlas* pAtlas, const string &strSettingPath, Settings* settings);
+    ~MapDrawer();
 
     void newParameterLoader(Settings* settings);
 
@@ -54,10 +60,11 @@ public:
     void SetReferenceKeyFrame(KeyFrame *pKF);
     void GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M, pangolin::OpenGlMatrix &MOw);
     void EstimateGroundPlane();
-    bool HasGroundPlane() const { return m_hasGroundPlane; }
-    bool HasAlignment() const { return m_hasAlignment; }
-    Eigen::Matrix3f GetAlignRotation() const { return m_R_align; }
-    Eigen::Vector3f GetAlignTranslation() const { return m_t_align; }
+    void InvalidateGroundPlane(); // Invalidate ground plane when map changes
+    bool HasGroundPlane() const;
+    bool HasAlignment() const;
+    Eigen::Matrix3f GetAlignRotation() const;
+    Eigen::Vector3f GetAlignTranslation() const;
     
     // Get aligned camera pose (world->camera) for a KeyFrame
     // Returns: (R_cw, t_cw) where R_cw is rotation and t_cw is translation
@@ -75,27 +82,15 @@ public:
     // X_ground, Z_ground: ground coordinates in meters (Y = 0 in aligned frame)
     bool PixelToGround(KeyFrame* pKF, float u, float v, float& X_ground, float& Z_ground);
     
-    // BEV (Bird's Eye View) functions
-    // Set BEV window parameters (in aligned world meters)
+    // BEV (Bird's Eye View) functions - delegated to BEVGenerator
+    BEVGenerator* GetBEVGenerator() { return mpBEVGenerator; }
+    const BEVGenerator* GetBEVGenerator() const { return mpBEVGenerator; }
+    
+    // Convenience wrappers for backward compatibility
     void SetBEVWindow(float X_min, float X_max, float Z_min, float Z_max, float pixels_per_meter = 300.0f);
-    
-    // Compute homography from image to BEV for a KeyFrame
-    // H_img2bev: 3x3 matrix mapping [u, v, 1]^T (pixel coords) to [u_bev, v_bev, 1]^T (BEV pixel coords)
-    // Returns true if successful, false if alignment not available
-    bool ComputeBEVHomography(KeyFrame* pKF, Eigen::Matrix3f& H_img2bev);
-    
-    // Get BEV image dimensions
-    int GetBEVWidth() const { return m_bev_width; }
-    int GetBEVHeight() const { return m_bev_height; }
-    
-    // Generate and display BEV image from a camera image and KeyFrame
-    // img: input camera image (will be warped to BEV)
-    // pKF: KeyFrame to use for pose and calibration
-    // window_name: OpenCV window name (default: "BEV View")
-    // max_display_size: maximum window size to fit on screen (default: 800 pixels)
-           void ShowBEVImage(const cv::Mat& img, KeyFrame* pKF, const std::string& window_name = "BEV View", int max_display_size = 800);
+    void SetBEVOutputDirectory(const std::string& dir);
+    void SaveAllKeyframeBEVs(const cv::Mat& current_img, KeyFrame* pCurrentKF);
            
-           void SaveAllKeyframeBEVs(const cv::Mat& current_img, KeyFrame* pCurrentKF);
 
 protected:
 
@@ -111,6 +106,7 @@ protected:
     Sophus::SE3f mCameraPose;
 
     std::mutex mMutexCamera;
+    mutable std::mutex mMutexGroundPlane; // Mutex for thread-safe access to ground plane state (mutable for const accessors)
 
     float mfFrameColors[6][3] = {{0.0f, 0.0f, 1.0f},
                                 {0.8f, 0.4f, 1.0f},
@@ -128,18 +124,14 @@ protected:
     Eigen::Matrix3f m_R_align = Eigen::Matrix3f::Identity();
     Eigen::Vector3f m_t_align = Eigen::Vector3f::Zero();
 
-    // BEV parameters
-    float m_bev_X_min = -2.0f;
-    float m_bev_X_max = 2.0f;
-    float m_bev_Z_min = 2.0f;
-    float m_bev_Z_max = 4.0f;
-    float m_bev_pixels_per_meter = 300.0f;  // Increased from 80 for higher resolution
-    int m_bev_width = 0;
-    int m_bev_height = 0;
+    // BEV generator instance
+    BEVGenerator* mpBEVGenerator;
     
-    // Track which keyframes have had their BEV saved (to avoid saving multiple times)
-    std::set<unsigned long> m_saved_bev_keyframes;
-    std::mutex mMutexSavedBEV; // Mutex for thread-safe access to m_saved_bev_keyframes
+    // Map change tracking for ground plane invalidation
+    unsigned int m_lastMapChangeIndex = 0;
+    bool m_groundPlaneEstimating = false; // Flag to prevent concurrent estimation
+    int m_lastEstimationPointCount = 0; // Track point count when plane was last estimated
+    
 
 private:
 

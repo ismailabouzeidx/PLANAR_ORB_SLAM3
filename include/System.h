@@ -185,6 +185,8 @@ public:
     void ChangeDataset();
 
     float GetImageScale();
+    
+    MapDrawer* GetMapDrawer() { return mpMapDrawer; }
 
 #ifdef REGISTER_TIMES
     void InsertRectTime(double& time);

@@ -18,9 +18,12 @@
 
 
 #include "Viewer.h"
+#include "BEVGenerator.h"
 #include <pangolin/pangolin.h>
 
 #include <mutex>
+#include <future>
+#include <chrono>
 
 namespace ORB_SLAM3
 {
@@ -338,8 +341,29 @@ void Viewer::Run()
         cv::imshow("ORB-SLAM3: Current Frame",toShow);
         cv::waitKey(mT);
 
-        // Show BEV image if alignment is available
-        if (mpMapDrawer->HasAlignment() && mpMapDrawer->mpAtlas)
+        // Save BEV images for all keyframes asynchronously
+        static int frame_counter = 0;
+        static std::future<bool> bev_save_future;
+        static bool bev_save_in_progress = false;
+        static std::vector<unsigned long> kf_queue;
+        static unsigned long last_processed_kf_id = 0;
+        frame_counter++;
+        
+        // Check if previous async save is complete (non-blocking)
+        if (bev_save_in_progress && bev_save_future.valid()) {
+            auto status = bev_save_future.wait_for(std::chrono::milliseconds(0));
+            if (status == std::future_status::ready) {
+                try {
+                    bev_save_future.get();
+                } catch (...) {
+                    // Ignore exceptions
+                }
+                bev_save_in_progress = false;
+            }
+        }
+        
+        // Process BEV saving every 60 frames (less frequent to avoid blocking)
+        if ((frame_counter % 60 == 0) && !bev_save_in_progress && mpMapDrawer->HasAlignment() && mpMapDrawer->mpAtlas && mpTracker && !mpTracker->mImGray.empty())
         {
             Map* pActiveMap = mpMapDrawer->mpAtlas->GetCurrentMap();
             if (pActiveMap)
@@ -347,35 +371,73 @@ void Viewer::Run()
                 const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
                 if (!vpKFs.empty())
                 {
-                    // Use the most recent KeyFrame (highest ID) for display
-                    KeyFrame* pKF = nullptr;
-                    unsigned long maxId = 0;
-                    for (auto kf : vpKFs)
-                    {
-                        if (kf && !kf->isBad() && kf->mpCamera && kf->mnId > maxId)
-                        {
-                            pKF = kf;
-                            maxId = kf->mnId;
+                    // Build queue of unsaved keyframes (only once, when queue is empty)
+                    if (kf_queue.empty()) {
+                        BEVGenerator* pBEVGen = mpMapDrawer->GetBEVGenerator();
+                        if (pBEVGen) {
+                            for (auto kf : vpKFs) {
+                                if (kf && !kf->isBad() && kf->mpCamera) {
+                                    // Check if already saved (this is a quick check, actual check happens in SaveKeyframeBEV)
+                                    kf_queue.push_back(kf->mnId);
+                                }
+                            }
+                            // Sort by ID to process in order
+                            std::sort(kf_queue.begin(), kf_queue.end());
+                            std::cout << "[Viewer] Built queue of " << kf_queue.size() << " keyframes for BEV saving" << std::endl;
                         }
                     }
                     
-                    if (pKF && mpTracker)
-                    {
-                        // Get the raw image from tracker
-                        cv::Mat im_raw;
-                        if (!mpTracker->mImGray.empty())
-                        {
-                            mpTracker->mImGray.copyTo(im_raw);
-                            // Convert to BGR if grayscale
-                            if (im_raw.channels() == 1)
-                            {
-                                cv::cvtColor(im_raw, im_raw, cv::COLOR_GRAY2BGR);
+                    // Process next keyframe in queue (only one at a time)
+                    if (!kf_queue.empty()) {
+                        unsigned long kf_id = kf_queue.front();
+                        kf_queue.erase(kf_queue.begin());
+                        
+                        // Find the KeyFrame
+                        KeyFrame* pKF = nullptr;
+                        for (auto kf : vpKFs) {
+                            if (kf && kf->mnId == kf_id) {
+                                pKF = kf;
+                                break;
                             }
-                            // Display BEV for the most recent keyframe
-                            mpMapDrawer->ShowBEVImage(im_raw, pKF, "BEV View", 800);
-                            
-                            // Save BEV for the current keyframe (only when it matches the current image)
-                            mpMapDrawer->SaveAllKeyframeBEVs(im_raw, pKF);
+                        }
+                        
+                        if (pKF) {
+                            // Get the raw image from tracker (use current image as proxy)
+                            cv::Mat im_raw;
+                            try {
+                                mpTracker->mImGray.copyTo(im_raw);
+                                if (!im_raw.empty()) {
+                                    // Convert to BGR if grayscale
+                                    if (im_raw.channels() == 1) {
+                                        cv::cvtColor(im_raw, im_raw, cv::COLOR_GRAY2BGR);
+                                    }
+                                    
+                                    // Save BEV asynchronously in background thread
+                                    bev_save_in_progress = true;
+                                    last_processed_kf_id = kf_id;
+                                    
+                                    std::cout << "[Viewer] Saving BEV for KF " << kf_id << " (async)" << std::endl;
+                                    
+                                    // Launch async task
+                                    bev_save_future = std::async(std::launch::async, 
+                                        [this, im_raw, pKF]() -> bool {
+                                            try {
+                                                mpMapDrawer->SaveAllKeyframeBEVs(im_raw, pKF);
+                                                return true;
+                                            } catch (...) {
+                                                return false;
+                                            }
+                                        });
+                                }
+                            } catch (...) {
+                                bev_save_in_progress = false;
+                            }
+                        }
+                    } else {
+                        // Queue is empty, reset for next round
+                        if (last_processed_kf_id > 0) {
+                            std::cout << "[Viewer] Completed BEV saving for all keyframes in queue" << std::endl;
+                            last_processed_kf_id = 0;
                         }
                     }
                 }
