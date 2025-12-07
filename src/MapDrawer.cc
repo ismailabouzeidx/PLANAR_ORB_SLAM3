@@ -17,6 +17,7 @@
 */
 
 #include "MapDrawer.h"
+#include "BEVGenerator.h"
 #include "MapPoint.h"
 #include "KeyFrame.h"
 #include <pangolin/pangolin.h>
@@ -26,6 +27,8 @@
 #include <Eigen/Geometry>
 #include <iostream>
 #include <cmath>
+#include <climits>
+#include <limits>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -87,6 +90,9 @@ namespace ORB_SLAM3
 
 MapDrawer::MapDrawer(Atlas* pAtlas, const string &strSettingPath, Settings* settings):mpAtlas(pAtlas)
 {
+    // Create BEV generator instance
+    mpBEVGenerator = new BEVGenerator(this);
+    
     if(settings){
         newParameterLoader(settings);
     }
@@ -106,11 +112,19 @@ MapDrawer::MapDrawer(Atlas* pAtlas, const string &strSettingPath, Settings* sett
 
             }
         }
+        
+        // Parse BEV parameters (optional)
+        mpBEVGenerator->ParseParameters(fSettings);
+        fSettings.release();
     }
-    
-    // Initialize BEV dimensions from default parameters
-    m_bev_width = static_cast<int>((m_bev_X_max - m_bev_X_min) * m_bev_pixels_per_meter);
-    m_bev_height = static_cast<int>((m_bev_Z_max - m_bev_Z_min) * m_bev_pixels_per_meter);
+}
+
+MapDrawer::~MapDrawer()
+{
+    if (mpBEVGenerator) {
+        delete mpBEVGenerator;
+        mpBEVGenerator = nullptr;
+    }
 }
 
 void MapDrawer::newParameterLoader(Settings *settings) {
@@ -195,6 +209,46 @@ bool MapDrawer::ParseViewerParamFile(cv::FileStorage &fSettings)
     return !b_miss_params;
 }
 
+
+bool MapDrawer::HasGroundPlane() const
+{
+    unique_lock<mutex> lock(mMutexGroundPlane);
+    return m_hasGroundPlane;
+}
+
+bool MapDrawer::HasAlignment() const
+{
+    unique_lock<mutex> lock(mMutexGroundPlane);
+    return m_hasAlignment;
+}
+
+Eigen::Matrix3f MapDrawer::GetAlignRotation() const
+{
+    unique_lock<mutex> lock(mMutexGroundPlane);
+    return m_R_align;
+}
+
+Eigen::Vector3f MapDrawer::GetAlignTranslation() const
+{
+    unique_lock<mutex> lock(mMutexGroundPlane);
+    return m_t_align;
+}
+
+void MapDrawer::InvalidateGroundPlane()
+{
+    unique_lock<mutex> lock(mMutexGroundPlane);
+    m_hasGroundPlane = false;
+    m_hasAlignment = false;
+    // Don't reset m_lastMapChangeIndex - let it be updated on next DrawMapPoints call
+}
+
+void MapDrawer::SetBEVOutputDirectory(const std::string& dir)
+{
+    if (mpBEVGenerator) {
+        mpBEVGenerator->SetOutputDirectory(dir);
+    }
+}
+
 void MapDrawer::DrawMapPoints()
 {
     Map* pActiveMap = mpAtlas->GetCurrentMap();
@@ -207,9 +261,58 @@ void MapDrawer::DrawMapPoints()
     if(vpMPs.empty())
         return;
 
-    // --- NEW: estimate plane once when map is non-empty ---
-    if (!m_hasGroundPlane) {
+    // Ground plane estimation strategy for BEV stitching:
+    // 1. Estimate once when we have enough points (stable, accurate)
+    // 2. Allow refinement when map has significantly more points (better accuracy)
+    // 3. Keep stable during minor optimizations (for consistent stitching)
+    int currentMapChangeIndex = pActiveMap->GetMapChangeIndex();
+    int numMapPoints = vpMPs.size();
+    
+    bool hasGP, hasAlign;
+    Eigen::Matrix3f R_align;
+    Eigen::Vector3f t_align;
+    int lastEstimationPointCount = 0;
+    {
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        hasGP = m_hasGroundPlane;
+        hasAlign = m_hasAlignment;
+        lastEstimationPointCount = m_lastEstimationPointCount;
+        if (hasAlign) {
+            R_align = m_R_align;
+            t_align = m_t_align;
+        }
+    }
+    
+    // Estimate or refine ground plane
+    bool shouldEstimate = false;
+    if (!hasGP) {
+        // First estimation: need at least 200 points for stable estimation
+        if (numMapPoints >= 200) {
+            shouldEstimate = true;
+        }
+    } else {
+        // Refinement: re-estimate if we have significantly more points (2x more)
+        // This improves accuracy for stitching without causing instability
+        if (numMapPoints >= lastEstimationPointCount * 2 && numMapPoints >= 500) {
+            shouldEstimate = true;
+        }
+    }
+    
+    if (shouldEstimate) {
         EstimateGroundPlane();
+        // Re-read after estimation
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        hasAlign = m_hasAlignment;
+        if (hasAlign) {
+            R_align = m_R_align;
+            t_align = m_t_align;
+        }
+    }
+    
+    // Update map change index (for tracking, not for invalidation)
+    {
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        m_lastMapChangeIndex = currentMapChangeIndex;
     }
 
     set<MapPoint*> spRefMPs(vpRefMPs.begin(), vpRefMPs.end());
@@ -224,8 +327,8 @@ void MapDrawer::DrawMapPoints()
             continue;
         Eigen::Vector3f pos = vpMPs[i]->GetWorldPos();
 
-        if (m_hasAlignment) {
-            pos = m_R_align * pos + m_t_align;
+        if (hasAlign) {
+            pos = R_align * pos + t_align;
         }
 
         glVertex3f(pos(0), pos(1), pos(2));
@@ -242,8 +345,8 @@ void MapDrawer::DrawMapPoints()
             continue;
         Eigen::Vector3f pos = (*sit)->GetWorldPos();
 
-        if (m_hasAlignment) {
-            pos = m_R_align * pos + m_t_align;
+        if (hasAlign) {
+            pos = R_align * pos + t_align;
         }
 
         glVertex3f(pos(0), pos(1), pos(2));
@@ -253,7 +356,7 @@ void MapDrawer::DrawMapPoints()
     glEnd();
 
     // === Draw ground plane grid (aligned) ===
-    if (m_hasAlignment)
+    if (hasAlign)
     {
         float halfSize = 5.0f;
         int steps = 10;
@@ -295,79 +398,16 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
 
     const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
 
-    // Debug: print heights of a few keyframe camera centers
-    if (m_hasAlignment && !vpKFs.empty())
+    // Get alignment state once with mutex protection
+    bool hasAlign;
+    Eigen::Matrix3f R_align;
+    Eigen::Vector3f t_align;
     {
-        int numToPrint = std::min(5, static_cast<int>(vpKFs.size()));
-        std::cout << "[MapDrawer] KeyFrame heights (aligned Y coordinate):" << std::endl;
-        for (int i = 0; i < numToPrint; ++i)
-        {
-            KeyFrame* pKF = vpKFs[i];
-            Eigen::Vector3f Ow = pKF->GetCameraCenter();
-            Eigen::Vector3f Ow_aligned = m_R_align * Ow + m_t_align;
-            float h = Ow_aligned.y();
-            std::cout << "  KF[" << i << "] (id=" << pKF->mnId << "): h = " << h << std::endl;
-        }
-        
-        // Test PixelToGround on first KeyFrame
-        if (!vpKFs.empty() && vpKFs[0]->mpCamera)
-        {
-            KeyFrame* pKF = vpKFs[0];
-            Eigen::Matrix3f K = pKF->mpCamera->toK_();
-            float cx = K(0, 2);
-            float cy = K(1, 2);
-            
-            // Test a few pixels: center, and some corners
-            std::vector<std::pair<float, float>> test_pixels = {
-                {cx, cy},           // image center
-                {cx - 100, cy},     // left of center
-                {cx + 100, cy},     // right of center
-                {cx, cy - 100},     // above center
-                {cx, cy + 100}      // below center
-            };
-            
-            std::cout << "[MapDrawer] Testing PixelToGround (KF id=" << pKF->mnId << "):" << std::endl;
-            for (const auto& pixel : test_pixels)
-            {
-                float u = pixel.first;
-                float v = pixel.second;
-                float X_ground, Z_ground;
-                if (PixelToGround(pKF, u, v, X_ground, Z_ground))
-                {
-                    std::cout << "  Pixel (" << u << ", " << v << ") -> ground (X, Z) = ("
-                              << X_ground << ", " << Z_ground << ") [aligned meters]" << std::endl;
-                }
-                else
-                {
-                    std::cout << "  Pixel (" << u << ", " << v << ") -> invalid (behind camera or at infinity)" << std::endl;
-                }
-            }
-            
-            // Test BEV homography
-            Eigen::Matrix3f H_img2bev;
-            if (ComputeBEVHomography(pKF, H_img2bev))
-            {
-                std::cout << "[MapDrawer] BEV homography computed (KF id=" << pKF->mnId << "):" << std::endl;
-                std::cout << "  BEV window: X=[" << m_bev_X_min << ", " << m_bev_X_max 
-                          << "], Z=[" << m_bev_Z_min << ", " << m_bev_Z_max << "]" << std::endl;
-                std::cout << "  BEV image size: " << m_bev_width << "x" << m_bev_height 
-                          << " pixels (" << m_bev_pixels_per_meter << " px/m)" << std::endl;
-                
-                // Test a few pixels -> BEV coordinates
-                for (const auto& pixel : test_pixels)
-                {
-                    float u = pixel.first;
-                    float v = pixel.second;
-                    Eigen::Vector3f uv1(u, v, 1.0f);
-                    Eigen::Vector3f bev = H_img2bev * uv1;
-                    if (std::abs(bev(2)) > 1e-6f)
-                    {
-                        bev /= bev(2);
-                        std::cout << "  Pixel (" << u << ", " << v << ") -> BEV (" 
-                                  << bev(0) << ", " << bev(1) << ")" << std::endl;
-                    }
-                }
-            }
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        hasAlign = m_hasAlignment;
+        if (hasAlign) {
+            R_align = m_R_align;
+            t_align = m_t_align;
         }
     }
 
@@ -378,10 +418,10 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             KeyFrame* pKF = vpKFs[i];
             Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
 
-            if (m_hasAlignment) {
+            if (hasAlign) {
                 Eigen::Matrix4f T_align = Eigen::Matrix4f::Identity();
-                T_align.block<3,3>(0,0) = m_R_align;
-                T_align.block<3,1>(0,3) = m_t_align;
+                T_align.block<3,3>(0,0) = R_align;
+                T_align.block<3,1>(0,3) = t_align;
                 Twc = T_align * Twc;
             }
 
@@ -446,7 +486,7 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
 
             glPopMatrix();
 
-            glEnd();
+            // glEnd();
         }
     }
 
@@ -462,8 +502,8 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             // Covisibility Graph
             const vector<KeyFrame*> vCovKFs = vpKFs[i]->GetCovisiblesByWeight(100);
             Eigen::Vector3f Ow = vpKFs[i]->GetCameraCenter();
-            if (m_hasAlignment) {
-                Ow = m_R_align * Ow + m_t_align;
+            if (hasAlign) {
+                Ow = R_align * Ow + t_align;
             }
             if(!vCovKFs.empty())
             {
@@ -472,8 +512,8 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
                     if((*vit)->mnId<vpKFs[i]->mnId)
                         continue;
                     Eigen::Vector3f Ow2 = (*vit)->GetCameraCenter();
-                    if (m_hasAlignment) {
-                        Ow2 = m_R_align * Ow2 + m_t_align;
+                    if (hasAlign) {
+                        Ow2 = R_align * Ow2 + t_align;
                     }
                     glVertex3f(Ow(0),Ow(1),Ow(2));
                     glVertex3f(Ow2(0),Ow2(1),Ow2(2));
@@ -485,8 +525,8 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             if(pParent)
             {
                 Eigen::Vector3f Owp = pParent->GetCameraCenter();
-                if (m_hasAlignment) {
-                    Owp = m_R_align * Owp + m_t_align;
+                if (hasAlign) {
+                    Owp = R_align * Owp + t_align;
                 }
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owp(0),Owp(1),Owp(2));
@@ -499,8 +539,8 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
                 if((*sit)->mnId<vpKFs[i]->mnId)
                     continue;
                 Eigen::Vector3f Owl = (*sit)->GetCameraCenter();
-                if (m_hasAlignment) {
-                    Owl = m_R_align * Owl + m_t_align;
+                if (hasAlign) {
+                    Owl = R_align * Owl + t_align;
                 }
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owl(0),Owl(1),Owl(2));
@@ -521,15 +561,15 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
         {
             KeyFrame* pKFi = vpKFs[i];
             Eigen::Vector3f Ow = pKFi->GetCameraCenter();
-            if (m_hasAlignment) {
-                Ow = m_R_align * Ow + m_t_align;
+            if (hasAlign) {
+                Ow = R_align * Ow + t_align;
             }
             KeyFrame* pNext = pKFi->mNextKF;
             if(pNext)
             {
                 Eigen::Vector3f Owp = pNext->GetCameraCenter();
-                if (m_hasAlignment) {
-                    Owp = m_R_align * Owp + m_t_align;
+                if (hasAlign) {
+                    Owp = R_align * Owp + t_align;
                 }
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owp(0),Owp(1),Owp(2));
@@ -555,10 +595,10 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
                 KeyFrame* pKF = vpKFs[i];
                 Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
 
-                if (m_hasAlignment) {
+                if (hasAlign) {
                     Eigen::Matrix4f T_align = Eigen::Matrix4f::Identity();
-                    T_align.block<3,3>(0,0) = m_R_align;
-                    T_align.block<3,1>(0,3) = m_t_align;
+                    T_align.block<3,3>(0,0) = R_align;
+                    T_align.block<3,1>(0,3) = t_align;
                     Twc = T_align * Twc;
                 }
 
@@ -681,11 +721,34 @@ void MapDrawer::GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M, pangolin
 
 void MapDrawer::EstimateGroundPlane()
 {
+    // Prevent concurrent estimation
+    {
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        if (m_groundPlaneEstimating) {
+            return; // Already estimating in another thread
+        }
+        if (m_hasGroundPlane) {
+            return; // Already estimated
+        }
+        m_groundPlaneEstimating = true;
+    }
+    
     Map* pActiveMap = mpAtlas->GetCurrentMap();
-    if (!pActiveMap) return;
+    if (!pActiveMap) {
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        m_groundPlaneEstimating = false;
+        return;
+    }
 
+    // Lock map mutex for reading map points
+    unique_lock<mutex> mapLock(pActiveMap->mMutexMapUpdate);
     const vector<MapPoint*> &vpMPs = pActiveMap->GetAllMapPoints();
-    if (vpMPs.empty()) return;
+    if (vpMPs.empty()) {
+        mapLock.unlock();
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        m_groundPlaneEstimating = false;
+        return;
+    }
 
     std::vector<Eigen::Vector3f> pts;
     pts.reserve(vpMPs.size());
@@ -701,18 +764,29 @@ void MapDrawer::EstimateGroundPlane()
 
         pts.push_back(pos);
     }
+    mapLock.unlock(); // Release map lock before expensive computation
 
-    if (pts.size() < 50) {
-        std::cout << "[MapDrawer] Not enough points to estimate ground plane." << std::endl;
+    // Require minimum points for stable estimation (higher threshold for better accuracy)
+    // For BEV stitching, we want accurate plane estimation
+    if (pts.size() < 200) {
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        m_groundPlaneEstimating = false;
         return;
     }
 
     PlaneLSQ plane = fitPlaneLeastSquares(pts);
 
-    m_groundNormal   = plane.n;
-    m_groundD        = plane.d;
-    m_groundCentroid = plane.centroid;
-    m_hasGroundPlane = true;
+    // Update ground plane state with mutex protection
+    // Track point count for refinement strategy
+    {
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        m_groundNormal   = plane.n;
+        m_groundD        = plane.d;
+        m_groundCentroid = plane.centroid;
+        m_hasGroundPlane = true;
+        m_lastEstimationPointCount = static_cast<int>(pts.size());
+        m_groundPlaneEstimating = false;
+    }
 
     // diagnostics (optional)
     Eigen::Vector3f up(0.0f, 1.0f, 0.0f);
@@ -721,8 +795,8 @@ void MapDrawer::EstimateGroundPlane()
     float angleDeg = std::acos(cosTheta) * 180.0f / static_cast<float>(M_PI);
 
     std::cout << "[MapDrawer] Ground plane estimated:\n"
-              << "  n = [" << m_groundNormal.transpose() << "]\n"
-              << "  d = " << m_groundD << "\n"
+              << "  n = [" << plane.n.transpose() << "]\n"
+              << "  d = " << plane.d << "\n"
               << "  centroid = [" << plane.centroid.transpose() << "]\n"
               << "  avg residual = " << plane.avgResidual
               << ", max residual = " << plane.maxResidual << "\n"
@@ -734,6 +808,7 @@ void MapDrawer::EstimateGroundPlane()
 
 void MapDrawer::ComputeWorldAlignmentFromPlane()
 {
+    unique_lock<mutex> lock(mMutexGroundPlane);
     if (!m_hasGroundPlane)
         return;
 
@@ -755,11 +830,29 @@ void MapDrawer::ComputeWorldAlignmentFromPlane()
     std::cout << "[MapDrawer] Alignment computed:\n"
               << "  R_align = \n" << m_R_align << "\n"
               << "  t_align = [" << m_t_align.transpose() << "]" << std::endl;
+    std::cout << "[MapDrawer] Ground plane estimation complete, returning..." << std::endl;
 }
 
 void MapDrawer::GetAlignedCameraPose(KeyFrame* pKF, Eigen::Matrix3f& R_cw, Eigen::Vector3f& t_cw)
 {
-    if (!m_hasAlignment || !pKF) {
+    if (!pKF) {
+        return;
+    }
+    
+    // Get alignment state with mutex protection
+    bool hasAlign;
+    Eigen::Matrix3f R_align;
+    Eigen::Vector3f t_align;
+    {
+        unique_lock<mutex> lock(mMutexGroundPlane);
+        hasAlign = m_hasAlignment;
+        if (hasAlign) {
+            R_align = m_R_align;
+            t_align = m_t_align;
+        }
+    }
+    
+    if (!hasAlign) {
         // If no alignment, return original pose
         Sophus::SE3f Tcw = pKF->GetPose();
         R_cw = Tcw.rotationMatrix();
@@ -768,6 +861,25 @@ void MapDrawer::GetAlignedCameraPose(KeyFrame* pKF, Eigen::Matrix3f& R_cw, Eigen
     }
 
     // STEP 1: Get camera pose in the aligned world frame
+    // Lock map mutex to safely access KeyFrame pose
+    Map* pMap = pKF->GetMap();
+    if (!pMap) {
+        return;
+    }
+    
+    // Try to acquire lock, but if it's already held (e.g., by BEVGenerator), 
+    // we can still proceed since we're only reading the pose
+    unique_lock<mutex> mapLock(pMap->mMutexMapUpdate, std::defer_lock);
+    if (!mapLock.try_lock()) {
+        // Lock is already held - this is OK for read-only access
+        // We'll proceed without the lock (the caller should have it)
+    }
+    
+    // Validate KeyFrame is still valid after acquiring lock (or if lock already held)
+    if (pKF->isBad()) {
+        return;
+    }
+    
     // 1) Original world->camera pose from ORB-SLAM3
     Sophus::SE3f Tcw = pKF->GetPose();    // camera from world
     Eigen::Matrix4f Tcw_mat = Tcw.matrix();
@@ -777,8 +889,8 @@ void MapDrawer::GetAlignedCameraPose(KeyFrame* pKF, Eigen::Matrix3f& R_cw, Eigen
 
     // 3) Build alignment transform T_align (same as in MapDrawer)
     Eigen::Matrix4f T_align = Eigen::Matrix4f::Identity();
-    T_align.block<3,3>(0,0) = m_R_align;
-    T_align.block<3,1>(0,3) = m_t_align;
+    T_align.block<3,3>(0,0) = R_align;
+    T_align.block<3,1>(0,3) = t_align;
 
     // 4) Camera->world in the **aligned** frame
     Eigen::Matrix4f Twc_aligned = T_align * Twc;
@@ -794,17 +906,32 @@ void MapDrawer::GetAlignedCameraPose(KeyFrame* pKF, Eigen::Matrix3f& R_cw, Eigen
 
 bool MapDrawer::ComputeGroundHomography(KeyFrame* pKF, Eigen::Matrix3f& H_plane2img, Eigen::Matrix3f& H_img2ground)
 {
-    if (!m_hasAlignment || !pKF || !pKF->mpCamera) {
+    std::cout << "[MapDrawer::ComputeGroundHomography] Starting for KF " << (pKF ? pKF->mnId : -1) << std::endl;
+    
+    if (!pKF || !pKF->mpCamera) {
+        std::cout << "[MapDrawer::ComputeGroundHomography] Early exit: invalid inputs" << std::endl;
+        return false;
+    }
+    
+    // Check alignment state
+    if (!HasAlignment()) {
+        std::cout << "[MapDrawer::ComputeGroundHomography] Early exit: no alignment" << std::endl;
         return false;
     }
 
+    std::cout << "[MapDrawer::ComputeGroundHomography] Getting camera intrinsics..." << std::endl;
+    
     // Get camera intrinsic matrix K
     Eigen::Matrix3f K = pKF->mpCamera->toK_();
 
+    std::cout << "[MapDrawer::ComputeGroundHomography] Getting aligned camera pose..." << std::endl;
+    
     // Get aligned camera pose
     Eigen::Matrix3f R_cw;
     Eigen::Vector3f t_cw;
     GetAlignedCameraPose(pKF, R_cw, t_cw);
+    
+    std::cout << "[MapDrawer::ComputeGroundHomography] Camera pose obtained, building homography..." << std::endl;
 
     // STEP 3: Build plane→image homography
     // H_plane2img = [K*r1  K*r3  K*t_cw]
@@ -814,14 +941,22 @@ bool MapDrawer::ComputeGroundHomography(KeyFrame* pKF, Eigen::Matrix3f& H_plane2
     H_plane2img.col(2) = K * t_cw;         // translation offset
 
     // STEP 4: Invert to get image→ground homography
+    std::cout << "[MapDrawer::ComputeGroundHomography] Inverting homography..." << std::endl;
     H_img2ground = H_plane2img.inverse();
+    
+    std::cout << "[MapDrawer::ComputeGroundHomography] Completed successfully" << std::endl;
 
     return true;
 }
 
 bool MapDrawer::PixelToGround(KeyFrame* pKF, float u, float v, float& X_ground, float& Z_ground)
 {
-    if (!m_hasAlignment || !pKF) {
+    if (!pKF) {
+        return false;
+    }
+    
+    // Check alignment state
+    if (!HasAlignment()) {
         return false;
     }
 
@@ -850,268 +985,18 @@ bool MapDrawer::PixelToGround(KeyFrame* pKF, float u, float v, float& X_ground, 
 
 void MapDrawer::SetBEVWindow(float X_min, float X_max, float Z_min, float Z_max, float pixels_per_meter)
 {
-    m_bev_X_min = X_min;
-    m_bev_X_max = X_max;
-    m_bev_Z_min = Z_min;
-    m_bev_Z_max = Z_max;
-    m_bev_pixels_per_meter = pixels_per_meter;
-    
-    // Compute BEV image dimensions
-    m_bev_width = static_cast<int>((X_max - X_min) * pixels_per_meter);
-    m_bev_height = static_cast<int>((Z_max - Z_min) * pixels_per_meter);
-}
-
-bool MapDrawer::ComputeBEVHomography(KeyFrame* pKF, Eigen::Matrix3f& H_img2bev)
-{
-    if (!m_hasAlignment || !pKF) {
-        return false;
+    if (mpBEVGenerator) {
+        mpBEVGenerator->SetWindow(X_min, X_max, Z_min, Z_max, pixels_per_meter);
     }
-
-    // Get image->ground homography
-    Eigen::Matrix3f H_plane2img, H_img2ground;
-    if (!ComputeGroundHomography(pKF, H_plane2img, H_img2ground)) {
-        return false;
-    }
-    
-    // Validate homography values
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            if (!std::isfinite(H_img2ground(r, c)) || std::abs(H_img2ground(r, c)) > 1e6) {
-                return false;
-            }
-        }
-    }
-
-    // Get camera position in aligned world coordinates
-    Eigen::Matrix3f R_cw;
-    Eigen::Vector3f t_cw;
-    GetAlignedCameraPose(pKF, R_cw, t_cw);
-    
-    // Validate camera pose
-    if (!std::isfinite(t_cw(0)) || !std::isfinite(t_cw(1)) || !std::isfinite(t_cw(2))) {
-        return false;
-    }
-    
-    // Camera position in aligned world (world->camera, so invert to get camera->world)
-    Eigen::Matrix3f R_wc = R_cw.transpose();
-    Eigen::Vector3f t_wc = -R_wc * t_cw;
-    
-    // Camera's Z position in aligned world coordinates
-    float camera_Z = t_wc(2);  // Z coordinate of camera in aligned world
-    
-    // Validate camera Z position
-    if (!std::isfinite(camera_Z)) {
-        return false;
-    }
-    
-    // Make BEV window relative to camera position
-    // m_bev_Z_min and m_bev_Z_max are now interpreted as offsets from camera
-    float Z_min_abs = camera_Z + m_bev_Z_min;  // Near distance from camera
-    float Z_max_abs = camera_Z + m_bev_Z_max;  // Far distance from camera
-    
-    // Validate Z bounds
-    if (!std::isfinite(Z_min_abs) || !std::isfinite(Z_max_abs) || Z_min_abs >= Z_max_abs) {
-        return false;
-    }
-    
-    // Build world→BEV transform T_bev
-    // X = X_min → u_bev = 0
-    // X = X_max → u_bev = bev_width
-    // Z = Z_max_abs → v_bev = 0     (far = top)
-    // Z = Z_min_abs → v_bev = bev_height  (near = bottom)
-    float s = m_bev_pixels_per_meter;
-    
-    if (!std::isfinite(s) || s <= 0 || s > 10000) {
-        return false;
-    }
-    
-    Eigen::Matrix3f T_bev = Eigen::Matrix3f::Identity();
-    T_bev <<
-        s,    0,  -s * m_bev_X_min,
-        0,   -s,   s * Z_max_abs,
-        0,    0,   1;
-
-    // Compose: image → ground → BEV
-    H_img2bev = T_bev * H_img2ground;
-    
-    // Final validation of result
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            if (!std::isfinite(H_img2bev(r, c)) || std::abs(H_img2bev(r, c)) > 1e6) {
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
-
-void MapDrawer::ShowBEVImage(const cv::Mat& img, KeyFrame* pKF, const std::string& window_name, int max_display_size)
-{
-    // if (!m_hasAlignment || !pKF || img.empty()) {
-    //     std::cerr << "[MapDrawer] Cannot show BEV: alignment not available or invalid input" << std::endl;
-    //     return;
-    // }
-
-    // // Compute BEV homography
-    // Eigen::Matrix3f H_img2bev;
-    // if (!ComputeBEVHomography(pKF, H_img2bev)) {
-    //     std::cerr << "[MapDrawer] Failed to compute BEV homography" << std::endl;
-    //     return;
-    // }
-
-    // // Convert Eigen matrix to OpenCV Mat
-    // cv::Mat H_cv(3, 3, CV_32F);
-    // for (int r = 0; r < 3; ++r) {
-    //     for (int c = 0; c < 3; ++c) {
-    //         H_cv.at<float>(r, c) = H_img2bev(r, c);
-    //     }
-    // }
-
-    // // Warp image to BEV (use INTER_CUBIC for better quality at higher resolution)
-    // cv::Mat img_bev;
-    // cv::warpPerspective(img, img_bev, H_cv, cv::Size(m_bev_width, m_bev_height),
-    //                     cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-
-    // // Display original full-size BEV
-    // // cv::imshow("BEV View (Original)", img_bev);
-    // // Resize to fit screen if needed
-    // cv::Mat img_display = img_bev;
-    // if (m_bev_width > max_display_size || m_bev_height > max_display_size) {
-    //     float scale = std::min(static_cast<float>(max_display_size) / m_bev_width,
-    //                           static_cast<float>(max_display_size) / m_bev_height);
-    //     int new_w = static_cast<int>(m_bev_width * scale);
-    //     int new_h = static_cast<int>(m_bev_height * scale);
-    //     cv::resize(img_bev, img_display, cv::Size(new_w, new_h), 0, 0, cv::INTER_AREA);
-    // }
-
-    // Display resized BEV in the specified window
-    // cv::imshow(window_name, img_display);
-    // cv::waitKey(1); // Non-blocking wait
 }
 
 void MapDrawer::SaveAllKeyframeBEVs(const cv::Mat& current_img, KeyFrame* pCurrentKF)
 {
-    if (!m_hasAlignment || current_img.empty() || !mpAtlas || !pCurrentKF) {
-        return;
-    }
-    
-    // Validate input image dimensions
-    if (current_img.cols <= 0 || current_img.rows <= 0 || 
-        current_img.cols > 10000 || current_img.rows > 10000) {
-        return;
-    }
-    
-    // Only save BEV for the current keyframe (the one that matches the current image)
-    // We can't use the current image for older keyframes because their poses don't match
-    std::lock_guard<std::mutex> lock(mMutexSavedBEV);
-    
-    // Skip if already saved (check again after acquiring lock)
-    if (m_saved_bev_keyframes.find(pCurrentKF->mnId) != m_saved_bev_keyframes.end()) {
-        return;
-    }
-    
-    // Validate keyframe is still valid
-    if (pCurrentKF->isBad() || !pCurrentKF->mpCamera) {
-        return;
-    }
-    
-    // Recalculate BEV dimensions to ensure they're up to date
-    m_bev_width = static_cast<int>((m_bev_X_max - m_bev_X_min) * m_bev_pixels_per_meter);
-    m_bev_height = static_cast<int>((m_bev_Z_max - m_bev_Z_min) * m_bev_pixels_per_meter);
-    
-    // Validate BEV dimensions to prevent malloc crashes - use more conservative limits
-    if (m_bev_width <= 0 || m_bev_height <= 0 || 
-        m_bev_width > 10000 || m_bev_height > 10000 ||
-        !std::isfinite(static_cast<float>(m_bev_width)) || !std::isfinite(static_cast<float>(m_bev_height))) {
-        return;
-    }
-    
-    // Compute BEV homography for the current keyframe
-    Eigen::Matrix3f H_img2bev;
-    if (!ComputeBEVHomography(pCurrentKF, H_img2bev)) {
-        return;
-    }
-    
-    // Convert Eigen matrix to OpenCV Mat and validate
-    cv::Mat H_cv(3, 3, CV_32F);
-    bool valid_h = true;
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            float val = H_img2bev(r, c);
-            if (!std::isfinite(val) || std::abs(val) > 1e6) {
-                valid_h = false;
-                break;
-            }
-            H_cv.at<float>(r, c) = val;
-        }
-        if (!valid_h) break;
-    }
-    
-    if (!valid_h) {
-        return;
-    }
-    
-    // Prepare image (convert to BGR if needed) - do this after validation to save memory
-    cv::Mat im_bgr;
-    if (current_img.channels() == 1) {
-        try {
-            cv::cvtColor(current_img, im_bgr, cv::COLOR_GRAY2BGR);
-        } catch (const cv::Exception& e) {
-            return;
-        }
-    } else {
-        im_bgr = current_img.clone();
-    }
-    
-    if (im_bgr.empty() || im_bgr.cols != current_img.cols || im_bgr.rows != current_img.rows) {
-        return;
-    }
-    
-    // Pre-allocate BEV image with validated dimensions - use create() for safety
-    cv::Mat img_bev;
-    try {
-        img_bev.create(m_bev_height, m_bev_width, CV_8UC3);
-        img_bev.setTo(cv::Scalar(0, 0, 0));
-    } catch (const cv::Exception& e) {
-        return;
-    } catch (const std::bad_alloc& e) {
-        return;
-    }
-    
-    // Validate allocation succeeded
-    if (img_bev.empty() || img_bev.cols != m_bev_width || img_bev.rows != m_bev_height) {
-        return;
-    }
-    
-    // Warp image to BEV (use INTER_LINEAR for large images to reduce memory usage)
-    try {
-        cv::warpPerspective(im_bgr, img_bev, H_cv, cv::Size(m_bev_width, m_bev_height),
-                            cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-    } catch (const cv::Exception& e) {
-        return; // Skip if warping fails
-    } catch (const std::bad_alloc& e) {
-        return;
-    }
-    
-    // Validate warped image
-    if (img_bev.empty() || img_bev.cols != m_bev_width || img_bev.rows != m_bev_height) {
-        return;
-    }
-    
-    // Save the BEV image
-    std::string bev_filename = "/home/ismo/data/orb_slam_bev/" + std::to_string(pCurrentKF->mnId) + ".png";
-    try {
-        // Clone before saving to ensure data integrity
-        cv::Mat img_to_save = img_bev.clone();
-        if (!img_to_save.empty() && cv::imwrite(bev_filename, img_to_save)) {
-            m_saved_bev_keyframes.insert(pCurrentKF->mnId);
-        }
-    } catch (const cv::Exception& e) {
-        // Skip if saving fails
-    } catch (const std::bad_alloc& e) {
-        // Skip if memory allocation fails
+    if (mpBEVGenerator && !current_img.empty() && pCurrentKF) {
+        mpBEVGenerator->SaveKeyframeBEV(current_img, pCurrentKF);
     }
 }
+
+
 
 } //namespace ORB_SLAM
