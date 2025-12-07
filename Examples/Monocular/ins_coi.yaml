@@ -65,3 +65,19 @@ Viewer.ViewpointY: -0.7
 Viewer.ViewpointZ: -3.5
 Viewer.ViewpointF: 500.0
 
+#--------------------------------------------------------------------------------------------
+# BEV (Bird's Eye View) Parameters
+#--------------------------------------------------------------------------------------------
+# BEV window parameters (in aligned world meters, after ground plane alignment)
+# X_min, X_max: horizontal range of BEV view (left to right)
+# Z_min, Z_max: depth range of BEV view (near to far, relative to camera)
+# pixels_per_meter: resolution of BEV image (higher = more detail but larger files)
+# output_dir: directory where BEV images will be saved (created automatically if missing)
+
+BEV.X_min: -2.0
+BEV.X_max: 2.0
+BEV.Z_min: 2.0
+BEV.Z_max: 3.5
+BEV.pixels_per_meter: 300.0
+BEV.output_dir: "/home/ismo/projects/ORB_SLAM3/Examples/Monocular/bev_output/"
+

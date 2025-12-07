@@ -91,3 +91,7 @@ my_settings.txt
 borrar/*
 
 */ExecMean.txt
+
+# BEV output directory
+Examples/Monocular/bev_output/
+Examples/*/bev_output/
